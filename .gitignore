@@ -43,3 +43,4 @@ artifacts/*
 !artifacts/.placeholder
 custom_packages/*.whl
 models/*.gguf
+docs/*
