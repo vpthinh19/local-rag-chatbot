@@ -146,7 +146,17 @@ HTTP failures have clear user-visible SSE errors:
 
 ## UI and API Contract
 
-Retain the existing browser UI and endpoints where practical:
+The existing vanilla UI is reused, not redesigned or replaced. `src/templates/index.html` remains the page shell, `src/static/style.css` remains the visual design and responsive/sidebar behavior, and `src/static/script.js` remains the browser controller. Do not introduce React, a build pipeline, a component library, or a new visual system.
+
+The only frontend changes are minimal compatibility changes required by the new backend contract:
+
+- Render clean persisted history rather than the legacy internal `[FILE]` message form.
+- Keep the existing chat stream/status/stop controls and adapt its SSE event parsing only when event names or payload fields change.
+- Keep the current document sidebar, attachment indication, download action, delete action, clear-chat action, theme toggle, and collapsed-sidebar state.
+- Continue using `textContent` for message/document values from the server; do not interpolate filenames or response text into `innerHTML`.
+- Refresh the existing document list after successful ingest, single-document delete, cancellation, and clear chat.
+
+Retain the existing browser endpoints where practical:
 
 - `POST /api/chat` accepts a message and optional PDF/DOCX and returns SSE statuses/content/done/error.
 - `POST /api/stop` requests cancellation only; it does not release CUDA memory.
@@ -156,7 +166,7 @@ Retain the existing browser UI and endpoints where practical:
 - `GET /api/documents/{file_id}/download` streams the server copy.
 - `DELETE /api/documents/{file_id}` removes one document and its index data.
 
-The frontend must render user history without internal file tags, keep using `textContent` for server/user data, refresh the document list after ingest/delete/clear, and keep download/delete controls. No preview or separate document-library UI is in scope.
+No preview, separate document-library UI, or UX redesign is in scope.
 
 ## Dependencies and Configuration
 
@@ -179,6 +189,7 @@ Automated tests must cover:
 4. Agent action validation: valid opaque ID, unique filename normalization, unknown/ambiguous reference rejection, action/argument caps, and no destructive action.
 5. Message construction proving raw context/tool messages are absent from persisted history and present only in the final-answer request.
 6. SSE response/cancellation behavior and no CUDA cleanup on stop, delete, clear, or normal chat.
+7. Browser smoke coverage confirming the existing chat form, streaming answer area, document sidebar, download/delete controls, clear chat, and theme/sidebar preferences still work without a UI redesign.
 
 Add a Vietnamese agent-evaluation fixture of 40–60 cases covering upload acknowledgement, upload summary, existing-file questions, summaries, multiple-file questions, follow-ups, ambiguous references, and small talk. Initial acceptance thresholds are:
 
@@ -196,3 +207,4 @@ Run a live capability smoke test against the actual Gemma 4 E4B `llama.cpp` cont
 - `httpx`, not OpenAI SDK, is the only model HTTP client.
 - Exactly three agent actions are exposed; only two read document data.
 - E4B is the current model. Keep a fixture-based evaluation so a future model change is evidence-driven rather than subjective.
+- The existing vanilla HTML/CSS/JS UI is retained; only minimal contract and safe-rendering adjustments are allowed.
