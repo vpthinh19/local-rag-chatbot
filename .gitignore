@@ -39,6 +39,7 @@ ENV/
 .env.local
 
 # Project specific
+.worktrees/
 artifacts/*
 !artifacts/.placeholder
 custom_packages/*.whl
