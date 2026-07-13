@@ -179,6 +179,12 @@ Configuration must expose:
 - `EMBED_BATCH_SIZE`, lexical/semantic candidate limits, rerank candidate cap (16), final chunk limit (1–6)
 - upload and persistence paths
 
+## Version Control
+
+Keep commits short and consistent with the repository's existing concise style. Stage only files belonging to the current task; never include unrelated worktree changes.
+
+Do not add `Codex`, agent, AI, or assistant identity to commit authorship, commit messages, bodies, trailers, or `Co-authored-by` lines. Use the repository's configured human Git identity unchanged.
+
 ## Verification and Acceptance Criteria
 
 Automated tests must cover:
