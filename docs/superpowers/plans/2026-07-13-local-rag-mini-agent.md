@@ -66,7 +66,7 @@ The exact number of helper functions is implementation-driven. Do not create ext
    - `numpy`
    - `torch`
 2. Add a dev dependency group containing `pytest` and `pytest-asyncio`.
-3. Confirm `llama-cpp-python`, OpenAI SDK, agent frameworks, task queues, and vector databases are absent.
+3. Confirm `llama-cpp-python`, `model2vec`, OpenAI SDK, agent frameworks, task queues, and vector databases are absent.
 4. Add preservation tests for the existing HTML control IDs and static assets.
 5. Add safety assertions that server/user filenames and message content are not interpolated into `innerHTML`. The current filename rendering is expected to fail until Task 8.
 6. Lock and sync the environment.
@@ -175,7 +175,7 @@ Use the exact endpoint shapes demonstrated in `test.txt`. Keep URL joining expli
 1. Non-2xx responses raise one bounded, user-safe model HTTP exception.
 2. SSE ignores blank/comment lines, recognizes `[DONE]`, and reports malformed JSON/choice shapes.
 3. Streaming tool calls accumulate fragmented IDs, function names, and argument strings by tool-call index.
-4. Embeddings validate row count, dimension, nonzero dimension, numeric types, and finite values.
+4. Embeddings parse the deployed batch shape as a list of indexed items, extract each vector from `embedding[0]`, map by item `index`, then validate row count, dimension, nonzero dimension, numeric types, and finite values.
 5. Reranking validates `results[*].index`, rejects duplicates/out-of-range indices, and maps scores by index rather than response order.
 6. Empty embedding/reranking inputs return immediately without an HTTP request.
 7. Cancelling the consumer closes the active HTTP response context but not the shared client.
@@ -187,7 +187,7 @@ Use `httpx.MockTransport` for:
 - direct content SSE;
 - fragmented tool-call SSE;
 - malformed SSE and missing `[DONE]` policy;
-- embedding batch and malformed dimensions;
+- embedding batch returned out of input order, nested-vector parsing, and malformed dimensions;
 - reranking responses deliberately returned out of input order;
 - timeout/non-2xx translation;
 - cancellation cleanup.
@@ -332,6 +332,7 @@ The worker can be launched independently and its only successful output is valid
 - a small private subprocess runner method that tests can replace.
 
 Avoid a persistent job manager. The ingest coroutine owns one subprocess and awaits it directly.
+It is also the sole authority that terminates, kills, and reaps that process; active request state only exposes the current handle for cancellation coordination.
 
 ### Ingest implementation order
 
@@ -577,7 +578,7 @@ Targets:
 
 ### Live reranker calibration
 
-Add a small multilingual relevance fixture with obvious positive/negative documents. Verify whether larger `relevance_score` means better relevance for the deployed model and investigate the contradictory example in `test.txt` before release. Do not encode score inversion without evidence from the live endpoint.
+Add a small multilingual relevance fixture with obvious positive/negative documents. Verify that larger `relevance_score` means better topical relevance for the deployed model. A factually contradictory sentence may still be highly relevant to the query, so do not use entailment or factual correctness as the score-order oracle. Do not encode score inversion without evidence from the live endpoint.
 
 ### Legacy removal
 

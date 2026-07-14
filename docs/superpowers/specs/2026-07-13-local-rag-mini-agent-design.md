@@ -50,6 +50,8 @@ The app must run with one Uvicorn worker. Multiple workers would duplicate the i
 
 File copying, JSON persistence, BM25, NumPy similarity, fusion, and HTTP orchestration remain in FastAPI. They are not separate processes.
 
+The three model servers are GPU-backed CUDA containers started and supervised outside FastAPI using the operational commands in `test.txt`. FastAPI neither spawns nor stops them; it only calls their configured HTTP endpoints.
+
 ## 4. Minimal source structure
 
 ```text
@@ -103,6 +105,8 @@ The active request state contains only:
 - the Docling subprocess handle when one exists.
 
 There is no durable job registry or multi-job queue. SSE emits coarse real states and periodic heartbeats while a long PDF is processed.
+
+The ingest coroutine is the sole owner of Docling process cleanup. The handle in active request state is for visibility and cancellation coordination, not a second process manager.
 
 ## 7. Document ingestion
 
@@ -240,6 +244,8 @@ The client validates:
 - streamed content versus tool-call deltas;
 - embedding row/dimension/finite-value invariants;
 - reranking indices and finite scores.
+
+For the deployed embedding endpoint, a batch response is a list with one item per input. Each item carries its input `index`, while the vector is the first row of that item's nested `embedding` field. The client maps rows by `index` rather than trusting response order. Reranking follows the same principle with `results[*].index`.
 
 Closing or cancelling an app request closes its active HTTP response context. The shared `AsyncClient` itself remains alive until FastAPI shutdown.
 
