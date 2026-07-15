@@ -1,34 +1,27 @@
 # Local RAG Chatbot
 
-Pet project RAG chạy trên một máy cá nhân có GPU NVIDIA. Thiết kế ưu tiên ít
-process, ít abstraction và không đưa model nặng vào web application.
+Chatbot RAG dành cho một máy cá nhân có GPU NVIDIA. Project giữ mọi thứ vừa đủ
+cho nhu cầu sử dụng cá nhân: dễ cài, dễ theo dõi và không cần thêm dịch vụ ngoài.
 
 ## Kiến trúc
 
-Hệ thống có bốn process chạy thường trực: một FastAPI process và ba
-[llama.cpp](https://github.com/ggml-org/llama.cpp) CUDA container. Mỗi lần upload
-tạo thêm đúng một LiteParse process group tạm thời; worker tự thoát sau khi parse
-và chunk để hệ điều hành thu hồi toàn bộ tài nguyên của parser.
+Trình duyệt chỉ làm việc với ứng dụng FastAPI. Ứng dụng nhận tin nhắn, quản lý
+tài liệu, tìm nội dung liên quan và gửi yêu cầu đến ba model chạy bằng
+[llama.cpp](https://github.com/ggml-org/llama.cpp). LLM, embedding và reranker nằm
+trong ba Docker container riêng nên có thể khởi động, kiểm tra hoặc thay thế độc
+lập.
+
+Bộ đọc tài liệu không chạy thường trực. Khi người dùng tải PDF hoặc DOCX lên,
+ứng dụng mới mở một tiến trình LiteParse để đọc file, OCR khi cần và chia văn bản
+thành các đoạn nhỏ. Tiến trình này kết thúc ngay sau khi trả kết quả, nhờ đó tài
+nguyên được hệ điều hành thu hồi hoàn toàn.
 
 ```mermaid
-flowchart LR
-    UI[Web UI] -->|SSE / REST| Gate[Single-request gate]
-
-    subgraph App[FastAPI - một process]
-        Gate --> Pipeline[Request pipeline]
-        Pipeline --> Documents[Document service]
-        Pipeline --> Agent[LLM-centered agent]
-        Agent --> RAG[Hybrid RAG index]
-        Documents --> State[(Corpus + history + uploads)]
-        RAG --> State
-    end
-
-    Documents -->|spawn / cancel process group| Parser[LiteParse + OCR worker]
-    Parser -->|Markdown chunks + page refs| Documents
-
-    Agent <-->|chat + overview| LLM[LLM container :8080]
-    RAG <-->|vectors| Embed[Embedding container :8081]
-    RAG <-->|candidate scores| Rerank[Reranker container :8082]
+flowchart TB
+    User[Người dùng] <-->|Tin nhắn, file và câu trả lời| App[Ứng dụng FastAPI]
+    App <-->|Yêu cầu suy luận| Models[Ba container chạy model<br/>LLM · Embedding · Reranker]
+    App <-->|Chỉ mở khi có file mới| Parser[Tiến trình đọc tài liệu<br/>LiteParse · OCR · chia đoạn]
+    App <-->|Đọc và ghi| Data[(Dữ liệu trên ổ đĩa<br/>file · nội dung đã xử lý · lịch sử chat)]
 ```
 
 ### Luồng upload và chat
@@ -36,43 +29,47 @@ flowchart LR
 ```mermaid
 sequenceDiagram
     participant U as Người dùng
-    participant A as FastAPI
-    participant P as Parse worker
-    participant M as Model containers
-    participant S as Persistent state
+    participant A as Ứng dụng
+    participant P as Bộ đọc tài liệu
+    participant M as Các model
+    participant S as Dữ liệu đã lưu
 
     U->>A: Tin nhắn + PDF/DOCX tùy chọn
-    A->>A: Khóa request slot
+    A->>A: Giữ lượt xử lý duy nhất
     opt Có file
-        A->>P: Spawn process group
-        P->>P: LiteParse, selective OCR, Markdown split
-        P-->>A: Chunks tối đa 1024 token + page refs
-        P-->>A: Worker kết thúc, tài nguyên được thu hồi
-        A->>M: Tạo overview và embedding
-        A->>S: Atomic commit file + corpus + index
+        A->>P: Mở tiến trình đọc file
+        P->>P: OCR khi cần, tạo Markdown và chia đoạn
+        P-->>A: Các đoạn văn kèm số trang
+        P-->>A: Tiến trình kết thúc
+        A->>M: Tạo phần giới thiệu và vector tìm kiếm
+        A->>S: Lưu file cùng nội dung đã xử lý
     end
-    A->>M: Lượt LLM đầu tiên
-    alt Trả lời trực tiếp
-        M-->>A: Stream nội dung
-    else Cần dữ liệu tài liệu
-        M-->>A: Một tool call
-        A->>A: Overview hoặc hybrid search
-        Note over A: BM25 + cosine -> RRF -> rerank
-        A->>M: Tool result, lượt LLM cuối
-        M-->>A: Stream câu trả lời có citation
+    A->>M: Đọc yêu cầu của người dùng
+    alt Không cần đọc tài liệu
+        M-->>A: Trả lời ngay
+    else Cần thông tin trong tài liệu
+        M-->>A: Chọn xem tổng quan hoặc tìm kiếm
+        A->>A: Tìm theo từ khóa và ý nghĩa, sau đó xếp hạng lại
+        A->>M: Gửi phần nội dung tìm được
+        M-->>A: Viết câu trả lời kèm nguồn
     end
-    A->>S: Lưu trọn turn thành công
-    A-->>U: SSE hoàn tất và mở khóa chat
+    A->>S: Lưu cuộc hội thoại đã hoàn tất
+    A-->>U: Mở lại ô chat
 ```
 
-Agent chỉ có hai công cụ: lấy overview để tóm tắt/dàn ý và hybrid search để tìm
-dữ kiện chi tiết. Một request dùng tối đa hai lượt LLM. Stop hoặc client disconnect
-sẽ hủy async task, gửi `SIGTERM` cho toàn bộ parser process group rồi nâng lên
-`SIGKILL` nếu quá grace period. Dữ liệu chưa commit bị bỏ; dữ liệu đã atomic-commit
-vẫn được giữ.
+LLM tự chọn cách xử lý. Hội thoại thông thường được trả lời ngay. Yêu cầu tóm tắt
+hoặc lập dàn ý dùng phần giới thiệu đã lưu của tài liệu. Câu hỏi về dữ kiện cụ thể
+sẽ tìm các đoạn liên quan rồi xếp hạng lại trước khi trả cho LLM. Sau khi file đã
+sẵn sàng, phần trả lời cần một lượt gọi LLM, hoặc hai lượt nếu phải đọc tài liệu.
 
-Không có parser daemon, task queue, vector database, agent framework, Torch hay
-`llama-cpp-python` trong application process.
+Trong lúc xử lý, ô chat được khóa để không có hai yêu cầu cùng sửa dữ liệu. Nút
+Stop sẽ dừng phần việc đang chạy; nếu tiến trình đọc file còn hoạt động thì cả
+nhóm tiến trình của nó cũng bị kết thúc. File chưa lưu xong sẽ bị bỏ, còn tài liệu
+đã hoàn tất trước đó vẫn được giữ nguyên.
+
+Project không cần parser chạy nền thường trực, hàng đợi tác vụ, vector database
+hay agent framework. Torch và `llama-cpp-python` cũng không nằm trong ứng dụng
+FastAPI.
 
 ## Phần cứng và nền tảng
 
