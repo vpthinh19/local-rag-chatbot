@@ -26,18 +26,25 @@ _SAFE_CHAR = re.compile(r"[^\w .()-]+", re.UNICODE)
 
 @dataclass(slots=True)
 class LiveCorpus:
+    """Mutable holder for the currently committed corpus snapshot."""
+
     value: Corpus
 
 
 @dataclass(slots=True)
 class RequestState:
+    """Cancellation and process handles owned by one chat request."""
+
     request_id: str
+    # The event reaches cooperative work; task/process handles stop hard work.
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task[Any] | None = None
     parse_process: asyncio.subprocess.Process | None = None
 
 
 class DocumentService:
+    """Coordinate disposable parsing and transactional corpus updates."""
+
     def __init__(
         self,
         settings: Settings,
@@ -45,6 +52,7 @@ class DocumentService:
         live_corpus: LiveCorpus,
         rag: RagIndex,
     ) -> None:
+        """Bind storage, model, corpus, and retrieval collaborators."""
         self._settings = settings
         self._llama = llama
         self._live = live_corpus
@@ -56,6 +64,7 @@ class DocumentService:
         content_or_upload: bytes | Any,
         request_state: RequestState,
     ) -> Document:
+        """Parse and commit one upload, or leave no partial document."""
         safe_name = self._safe_name(upload_name)
         extension = Path(safe_name).suffix.lower()
         file_id = uuid4().hex
@@ -112,6 +121,7 @@ class DocumentService:
             candidate_corpus = self._live.value.with_document(document, chunks)
             self._raise_if_cancelled(request_state)
 
+            # Commit order keeps the live index behind durable file and corpus state.
             self._settings.uploads_dir.mkdir(parents=True, exist_ok=True)
             os.replace(staged_input, final_upload)
             try:
@@ -126,6 +136,7 @@ class DocumentService:
             shutil.rmtree(staging, ignore_errors=True)
 
     def delete(self, file_id: str) -> bool:
+        """Transactionally remove one document from disk, corpus, and index."""
         document = next(
             (item for item in self._live.value.documents if item.file_id == file_id),
             None,
@@ -138,6 +149,7 @@ class DocumentService:
         temporary = self._settings.staging_dir / f"delete-{uuid4().hex}"
         moved = False
         temporary.parent.mkdir(parents=True, exist_ok=True)
+        # Moving first allows the upload to be restored if corpus persistence fails.
         if upload.exists():
             os.replace(upload, temporary)
             moved = True
@@ -153,6 +165,7 @@ class DocumentService:
         return True
 
     def clear(self) -> None:
+        """Persist an empty corpus, then remove every committed upload."""
         previous = self._live.value
         empty = Corpus()
         candidate_index = self._rag.prepare_clear()
@@ -165,6 +178,7 @@ class DocumentService:
             )
 
     def prune_missing_uploads(self, corpus: Corpus) -> Corpus:
+        """Reconcile persisted metadata with source files during startup."""
         self._settings.ensure_dirs()
         kept_documents = [
             document
@@ -190,6 +204,7 @@ class DocumentService:
     async def _spawn_worker(
         self, command: list[str]
     ) -> asyncio.subprocess.Process:
+        """Spawn the parser in a new process group for bounded cleanup."""
         return await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.DEVNULL,
@@ -202,6 +217,7 @@ class DocumentService:
         process: asyncio.subprocess.Process,
         state: RequestState,
     ) -> int:
+        """Wait until the worker exits or request cancellation wins."""
         wait_task = asyncio.create_task(process.wait())
         cancel_task = asyncio.create_task(state.cancel_event.wait())
         try:
@@ -224,6 +240,7 @@ class DocumentService:
     async def _stop_worker_group(
         self, process: asyncio.subprocess.Process
     ) -> None:
+        """Terminate the worker group, escalating to SIGKILL after grace."""
         if process.returncode is not None:
             await process.wait()
             return
@@ -232,6 +249,7 @@ class DocumentService:
         except ProcessLookupError:
             await process.wait()
             return
+        # Signal the group so OCR helpers cannot outlive their worker parent.
         with suppress(ProcessLookupError):
             os.killpg(process_group, signal.SIGTERM)
         try:
@@ -247,6 +265,7 @@ class DocumentService:
     async def _await_or_cancel(
         self, awaitable: Awaitable[_T], state: RequestState
     ) -> _T:
+        """Race asynchronous work against the request cancellation event."""
         work = asyncio.ensure_future(awaitable)
         cancellation = asyncio.create_task(state.cancel_event.wait())
         try:
@@ -268,6 +287,7 @@ class DocumentService:
             await asyncio.gather(cancellation, return_exceptions=True)
 
     async def _read_upload(self, source: bytes | Any) -> bytes:
+        """Read bytes or an upload stream without exceeding the size limit."""
         if isinstance(source, (bytes, bytearray, memoryview)):
             content = bytes(source)
         else:
@@ -298,6 +318,7 @@ class DocumentService:
     async def _create_overview(
         self, file_name: str, chunks: list[Chunk]
     ) -> str:
+        """Generate a bounded overview from parsed chunks."""
         sections = [
             f"[{', '.join(chunk.refs)}]\n{chunk.text}" for chunk in chunks
         ]
@@ -326,6 +347,7 @@ class DocumentService:
 
     @staticmethod
     async def _worker_error(process: asyncio.subprocess.Process) -> str:
+        """Read a bounded, single-line parser error message."""
         if process.stderr is None:
             return ""
         value = await process.stderr.read(2_048)
@@ -335,6 +357,7 @@ class DocumentService:
     def _load_worker_chunks(
         path: Path, file_id: str, file_name: str
     ) -> list[Chunk]:
+        """Load worker output and verify its upload identity and ordering."""
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
             raw_chunks = value["chunks"]
@@ -354,6 +377,7 @@ class DocumentService:
 
     @staticmethod
     def _safe_name(upload_name: str) -> str:
+        """Normalize an upload display name and enforce supported suffixes."""
         if not isinstance(upload_name, str) or "\x00" in upload_name:
             raise DataValidationError("upload filename is invalid")
         basename = Path(upload_name.replace("\\", "/")).name.strip()
@@ -367,9 +391,11 @@ class DocumentService:
         return basename
 
     def _upload_path(self, file_id: str, file_name: str) -> Path:
+        """Return the committed source path for a document."""
         return self._settings.uploads_dir / f"{file_id}_{file_name}"
 
     @staticmethod
     def _raise_if_cancelled(state: RequestState) -> None:
+        """Stop a transaction before its next irreversible step."""
         if state.cancel_event.is_set():
             raise asyncio.CancelledError

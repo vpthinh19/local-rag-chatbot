@@ -16,12 +16,16 @@ from src.models import Chunk, Corpus
 
 @dataclass(frozen=True, slots=True)
 class _IndexState:
+    """An installable, internally aligned retrieval snapshot."""
+
     chunks: tuple[Chunk, ...]
     vectors: np.ndarray
     lexical: bm25s.BM25 | None
 
 
 class RagIndex:
+    """Combine BM25 and embeddings, then rerank a bounded candidate set."""
+
     def __init__(
         self,
         llama: LlamaClient,
@@ -32,6 +36,7 @@ class RagIndex:
         candidate_limit: int,
         final_limit: int,
     ) -> None:
+        """Configure bounded retrieval stages and an empty initial state."""
         limits = (
             batch_size,
             lexical_limit,
@@ -51,27 +56,33 @@ class RagIndex:
 
     @property
     def chunk_count(self) -> int:
+        """Return the number of indexed chunks."""
         return len(self._state.chunks)
 
     @property
     def vector_shape(self) -> tuple[int, ...]:
+        """Expose the embedding matrix shape for diagnostics."""
         return self._state.vectors.shape
 
     @property
     def vector_dtype(self) -> np.dtype:
+        """Expose the embedding matrix dtype for diagnostics."""
         return self._state.vectors.dtype
 
     @property
     def file_ids(self) -> set[str]:
+        """Return document IDs represented in the current index."""
         return {chunk.file_id for chunk in self._state.chunks}
 
     async def rebuild(self, corpus: Corpus) -> None:
+        """Replace the index from a complete persisted corpus."""
         chunks = tuple(corpus.chunks)
         vectors = await self._embed_batched([chunk.text for chunk in chunks])
         candidate = self._make_state(chunks, vectors)
         self.install(candidate)
 
     async def prepare_add(self, chunks: list[Chunk]) -> _IndexState:
+        """Build an add candidate without mutating the live index."""
         if not chunks:
             return self._state
         existing_ids = {
@@ -97,6 +108,7 @@ class RagIndex:
         return self._make_state(self._state.chunks + tuple(chunks), vectors)
 
     def prepare_remove(self, file_id: str) -> _IndexState:
+        """Build a removal candidate without mutating the live index."""
         keep = [
             index
             for index, chunk in enumerate(self._state.chunks)
@@ -114,12 +126,14 @@ class RagIndex:
         return self._make_state(chunks, vectors)
 
     def prepare_clear(self) -> _IndexState:
+        """Build an empty candidate preserving the vector dimension."""
         dimension = self._state.vectors.shape[1]
         return self._make_state(
             (), np.empty((0, dimension), dtype=np.float32)
         )
 
     def install(self, candidate_state: _IndexState) -> None:
+        """Atomically expose a fully prepared retrieval snapshot."""
         if not isinstance(candidate_state, _IndexState):
             raise TypeError("candidate_state was not prepared by RagIndex")
         self._state = candidate_state
@@ -127,6 +141,7 @@ class RagIndex:
     async def search(
         self, queries: list[str], file_ids: list[str], limit: int
     ) -> list[Chunk]:
+        """Retrieve across query rewrites and return reranker-sorted chunks."""
         state = self._state
         clean_queries = [query.strip() for query in queries if query.strip()]
         if not state.chunks or not clean_queries or limit <= 0:
@@ -152,6 +167,7 @@ class RagIndex:
         if query_vectors.shape[1] != state.vectors.shape[1]:
             raise ValueError("query embedding dimension does not match RAG index")
 
+        # Query rewrites share candidates; retain each chunk's strongest rerank score.
         best_scores: dict[int, float] = {}
         for query, query_vector in zip(clean_queries, query_vectors, strict=True):
             lexical = self._lexical_ranking(state, query, allowed)
@@ -177,6 +193,7 @@ class RagIndex:
         return [state.chunks[index] for index in ranked[:result_limit]]
 
     async def _embed_batched(self, texts: list[str]) -> np.ndarray:
+        """Embed bounded batches into one normalized float32 matrix."""
         if not texts:
             return np.empty((0, 0), dtype=np.float32)
         rows: list[list[float]] = []
@@ -199,6 +216,7 @@ class RagIndex:
     def _lexical_ranking(
         self, state: _IndexState, query: str, allowed: np.ndarray
     ) -> list[int]:
+        """Rank allowed chunks by positive BM25 score."""
         if state.lexical is None:
             return []
         tokens = self._tokenize_one(query)
@@ -213,6 +231,7 @@ class RagIndex:
     def _semantic_ranking(
         self, state: _IndexState, query_vector: np.ndarray, allowed: np.ndarray
     ) -> list[int]:
+        """Rank allowed chunks by cosine similarity."""
         scores = state.vectors[allowed] @ query_vector
         pairs = zip(allowed.tolist(), scores.tolist(), strict=True)
         return [
@@ -223,7 +242,9 @@ class RagIndex:
         ]
 
     def _fuse(self, *rankings: list[int]) -> list[int]:
+        """Fuse lexical and semantic ranks with reciprocal rank fusion."""
         scores: dict[int, float] = {}
+        # RRF compares ranks rather than incompatible BM25/cosine score scales.
         for ranking in rankings:
             for rank, index in enumerate(ranking, start=1):
                 scores[index] = scores.get(index, 0.0) + 1.0 / (60 + rank)
@@ -235,6 +256,7 @@ class RagIndex:
     def _make_state(
         cls, chunks: tuple[Chunk, ...], vectors: np.ndarray
     ) -> _IndexState:
+        """Validate aligned vectors and construct the matching BM25 index."""
         if vectors.dtype != np.float32:
             vectors = vectors.astype(np.float32)
         if vectors.ndim != 2 or vectors.shape[0] != len(chunks):
@@ -252,6 +274,7 @@ class RagIndex:
     def _normalize_rows(
         values: list[list[float]], *, expected_rows: int, label: str
     ) -> np.ndarray:
+        """Validate and L2-normalize embedding rows for cosine products."""
         try:
             matrix = np.asarray(values, dtype=np.float32)
         except (TypeError, ValueError, OverflowError) as exc:
@@ -267,6 +290,7 @@ class RagIndex:
 
     @staticmethod
     def _tokenize_many(texts: list[str]) -> list[list[str]]:
+        """Tokenize text for BM25 without language-specific stemming."""
         return bm25s.tokenize(
             texts,
             stopwords=None,
@@ -277,4 +301,5 @@ class RagIndex:
 
     @classmethod
     def _tokenize_one(cls, text: str) -> list[str]:
+        """Tokenize one query with the document tokenizer."""
         return cls._tokenize_many([text])[0]

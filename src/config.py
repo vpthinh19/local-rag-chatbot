@@ -9,13 +9,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _url_from_env(name: str, default: str) -> str:
+    """Read a service URL without a trailing slash."""
     return os.getenv(name, default).rstrip("/")
 
 
 @dataclass(frozen=True, slots=True)
 class Settings:
+    """Centralize filesystem, model endpoint, and resource limits."""
+
     data_dir: Path = PROJECT_ROOT / "data"
 
+    # Independent llama.cpp-compatible model services.
     llm_url: str = field(
         default_factory=lambda: _url_from_env("LLM_URL", "http://127.0.0.1:8080")
     )
@@ -26,11 +30,13 @@ class Settings:
         default_factory=lambda: _url_from_env("RERANK_URL", "http://127.0.0.1:8082")
     )
 
+    # Shared HTTP bounds prevent a stalled model from blocking the only request slot.
     http_connect_timeout: float = 5.0
     http_read_timeout: float = 120.0
     http_write_timeout: float = 30.0
     http_pool_timeout: float = 5.0
 
+    # Ingestion and retrieval budgets keep memory and prompt size predictable.
     max_upload_bytes: int = 25 * 1024 * 1024
     max_context_chars: int = 48_000
     embedding_batch_size: int = 32
@@ -43,6 +49,7 @@ class Settings:
     tokenizer_name: str = "BAAI/bge-m3"
 
     def __post_init__(self) -> None:
+        """Normalize paths and reject nonpositive resource limits."""
         object.__setattr__(self, "data_dir", Path(self.data_dir))
         numeric_limits = {
             "http_connect_timeout": self.http_connect_timeout,
@@ -65,21 +72,26 @@ class Settings:
 
     @property
     def uploads_dir(self) -> Path:
+        """Return the directory containing committed source files."""
         return self.data_dir / "uploads"
 
     @property
     def staging_dir(self) -> Path:
+        """Return the directory for request-scoped temporary files."""
         return self.data_dir / "staging"
 
     @property
     def corpus_path(self) -> Path:
+        """Return the persisted corpus manifest path."""
         return self.data_dir / "corpus" / "corpus.json"
 
     @property
     def history_path(self) -> Path:
+        """Return the persisted chat history path."""
         return self.data_dir / "history" / "chat_history.json"
 
     def ensure_dirs(self) -> None:
+        """Create every application-owned data directory."""
         for path in (
             self.uploads_dir,
             self.staging_dir,

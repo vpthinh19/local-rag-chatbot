@@ -15,11 +15,15 @@ class ModelHTTPError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class ContentEvent:
+    """A streamed fragment of assistant-visible text."""
+
     content: str
 
 
 @dataclass(frozen=True, slots=True)
 class ToolCallEvent:
+    """One fully assembled tool call from the LLM stream."""
+
     index: int
     call_id: str
     name: str
@@ -31,12 +35,16 @@ ChatEvent = ContentEvent | ToolCallEvent
 
 @dataclass(slots=True)
 class _ToolCallParts:
+    """Fragments accumulated for one streamed tool call."""
+
     call_id: str = ""
     name: str = ""
     arguments: str = ""
 
 
 class LlamaClient:
+    """Validate the HTTP contracts of LLM, embed, and rerank servers."""
+
     def __init__(
         self,
         client: httpx.AsyncClient,
@@ -44,6 +52,7 @@ class LlamaClient:
         embed_url: str,
         rerank_url: str,
     ) -> None:
+        """Bind one shared HTTP client to the three model endpoints."""
         self._client = client
         self._llm_url = llm_url.rstrip("/")
         self._embed_url = embed_url.rstrip("/")
@@ -55,12 +64,14 @@ class LlamaClient:
         tools: list[dict[str, object]] | None = None,
         tool_choice: str | dict[str, object] | None = None,
     ) -> AsyncIterator[ChatEvent]:
+        """Stream text immediately and emit complete tool calls at EOF."""
         payload: dict[str, object] = {"messages": messages, "stream": True}
         if tools is not None:
             payload["tools"] = tools
         if tool_choice is not None:
             payload["tool_choice"] = tool_choice
 
+        # llama.cpp may split every tool-call field across multiple SSE deltas.
         tool_parts: dict[int, _ToolCallParts] = {}
         saw_done = False
         try:
@@ -125,6 +136,7 @@ class LlamaClient:
         max_tokens: int,
         temperature: float,
     ) -> str:
+        """Request one validated, non-streaming LLM completion."""
         payload = await self._request_json(
             "LLM completion",
             f"{self._llm_url}/v1/chat/completions",
@@ -144,6 +156,7 @@ class LlamaClient:
         return content
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
+        """Embed texts and restore vectors to input order."""
         if not texts:
             return []
         payload = await self._request_json(
@@ -183,6 +196,7 @@ class LlamaClient:
         return [vector for vector in vectors if vector is not None]
 
     async def rerank(self, query: str, documents: list[str]) -> list[float]:
+        """Score documents and restore scores to input order."""
         if not documents:
             return []
         payload = await self._request_json(
@@ -220,6 +234,7 @@ class LlamaClient:
     async def _request_json(
         self, label: str, url: str, payload: dict[str, object]
     ) -> Any:
+        """POST JSON and translate transport failures into one error type."""
         try:
             response = await self._client.post(url, json=payload)
             await self._validate_status(response, label)
@@ -236,6 +251,7 @@ class LlamaClient:
 
     @staticmethod
     async def _validate_status(response: httpx.Response, label: str) -> None:
+        """Raise a bounded error containing the upstream response detail."""
         if response.is_success:
             return
         await response.aread()
@@ -247,6 +263,7 @@ class LlamaClient:
 
     @staticmethod
     def _parse_stream_delta(data: str) -> dict[str, Any]:
+        """Extract and validate an OpenAI-compatible stream delta."""
         try:
             payload = json.loads(data)
             choices = payload["choices"]
@@ -264,6 +281,7 @@ class LlamaClient:
     def _accumulate_tool_calls(
         raw_tool_calls: object, parts_by_index: dict[int, _ToolCallParts]
     ) -> None:
+        """Append streamed tool-call fragments by their call index."""
         if not isinstance(raw_tool_calls, list):
             raise ModelHTTPError("invalid LLM stream: tool_calls must be an array")
         for raw_call in raw_tool_calls:
@@ -294,6 +312,7 @@ class LlamaClient:
 
     @staticmethod
     def _response_index(value: object, size: int, label: str) -> int:
+        """Validate an upstream result index against the request size."""
         if (
             isinstance(value, bool)
             or not isinstance(value, int)
@@ -305,6 +324,7 @@ class LlamaClient:
 
     @staticmethod
     def _finite_vector(value: list[object], label: str) -> list[float]:
+        """Convert a numeric vector while rejecting NaN and infinity."""
         vector: list[float] = []
         for number in value:
             if isinstance(number, bool) or not isinstance(number, (int, float)):

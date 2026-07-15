@@ -18,6 +18,8 @@ class ChatProtocolError(RuntimeError):
 
 @dataclass(slots=True)
 class LiveHistory:
+    """Mutable holder for the currently committed history snapshot."""
+
     value: History
 
 
@@ -86,6 +88,8 @@ FINAL_INSTRUCTION = (
 
 
 class ChatAgent:
+    """Run a bounded direct-answer or single-tool LLM interaction."""
+
     def __init__(
         self,
         settings: Settings,
@@ -94,6 +98,7 @@ class ChatAgent:
         live_corpus: LiveCorpus,
         live_history: LiveHistory,
     ) -> None:
+        """Bind model, retrieval, corpus, and history state."""
         self._settings = settings
         self._llama = llama
         self._rag = rag
@@ -102,11 +107,13 @@ class ChatAgent:
 
     @property
     def corpus(self) -> Corpus:
+        """Expose the current corpus snapshot for read-only callers."""
         return self._corpus.value
 
     async def stream(
         self, message: str, *, new_document_id: str | None = None
     ) -> AsyncIterator[str]:
+        """Stream one answer and persist it only after successful completion."""
         user_message = message.strip()
         if not user_message:
             raise ValueError("chat message must not be empty")
@@ -129,6 +136,7 @@ class ChatAgent:
             else:
                 raise ChatProtocolError("unknown chat stream event")
 
+        # A first-turn answer and a tool call are mutually exclusive protocols.
         if content_parts:
             answer = "".join(content_parts)
             self._persist_turn(user_message, answer)
@@ -140,6 +148,7 @@ class ChatAgent:
 
         call = tool_calls[0]
         tool_result = await self._execute_tool(call)
+        # Tool context is request-local; only the final plain-text turn is persisted.
         local_messages = list(messages)
         local_messages.extend(
             [
@@ -183,6 +192,7 @@ class ChatAgent:
     def _first_messages(
         self, user_message: str, new_document_id: str | None
     ) -> list[dict[str, object]]:
+        """Build the first LLM turn with catalog, context, and protocol rules."""
         catalog = [
             {
                 "file_id": document.file_id,
@@ -215,6 +225,7 @@ class ChatAgent:
         ]
 
     def _recent_history(self) -> list[Message]:
+        """Select a bounded suffix of recent persisted conversation."""
         selected: list[Message] = []
         size = 0
         for message in reversed(self._history.value.messages[-12:]):
@@ -226,6 +237,7 @@ class ChatAgent:
         return list(reversed(selected))
 
     async def _execute_tool(self, call: ToolCallEvent) -> str:
+        """Validate and execute the one tool selected by the LLM."""
         try:
             arguments = json.loads(call.arguments)
         except json.JSONDecodeError as exc:
@@ -298,6 +310,7 @@ class ChatAgent:
     def _resolve_file_ids(
         self, references: list[str]
     ) -> tuple[list[str], dict[str, object] | None]:
+        """Resolve file IDs or unique filenames into canonical IDs."""
         documents = self._corpus.value.documents
         by_id = {document.file_id: document for document in documents}
         resolved: list[str] = []
@@ -338,6 +351,7 @@ class ChatAgent:
         return resolved, None
 
     def _encode_tool_result(self, payload: dict[str, object]) -> str:
+        """Serialize tool data, shrinking long text to the context budget."""
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         if len(encoded) <= self._settings.max_context_chars:
             return json.dumps(payload, ensure_ascii=False, indent=2)
@@ -347,6 +361,7 @@ class ChatAgent:
             values = payload.get(key)
             if isinstance(values, list):
                 text_fields.extend(item for item in values if isinstance(item, dict))
+        # Halving preserves every result's metadata before dropping useful text.
         while len(encoded) > self._settings.max_context_chars and text_fields:
             changed = False
             for item in text_fields:
@@ -364,6 +379,7 @@ class ChatAgent:
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
     def _persist_turn(self, user: str, assistant: str) -> None:
+        """Atomically persist and expose one completed chat turn."""
         if not assistant.strip():
             raise ChatProtocolError("model returned an empty answer")
         candidate = self._history.value.with_turn(user, assistant)
@@ -372,6 +388,7 @@ class ChatAgent:
 
     @staticmethod
     def _require_exact_keys(value: dict[str, object], expected: set[str]) -> None:
+        """Reject tool arguments outside their declared schema."""
         if set(value) != expected:
             raise ChatProtocolError("tool arguments have unexpected or missing fields")
 
@@ -379,6 +396,7 @@ class ChatAgent:
     def _string_list(
         value: object, label: str, minimum: int, maximum: int
     ) -> list[str]:
+        """Validate, trim, and return a bounded string array."""
         if not isinstance(value, list) or not minimum <= len(value) <= maximum:
             raise ChatProtocolError(
                 f"{label} must contain between {minimum} and {maximum} values"

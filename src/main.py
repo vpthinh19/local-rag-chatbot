@@ -23,6 +23,8 @@ from src.rag import RagIndex
 
 @dataclass(slots=True)
 class ApplicationRuntime:
+    """Own live services and enforce the single-active-request rule."""
+
     settings: Settings
     http: httpx.AsyncClient
     live_corpus: LiveCorpus
@@ -30,10 +32,12 @@ class ApplicationRuntime:
     rag: RagIndex
     documents: DocumentService
     chat: ChatAgent
+    # The lock protects slot ownership across chat, stop, and CRUD endpoints.
     active: RequestState | None = None
     active_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def claim_request(self) -> RequestState | None:
+        """Claim the sole request slot, or return None when busy."""
         async with self.active_lock:
             if self.active is not None:
                 return None
@@ -42,15 +46,18 @@ class ApplicationRuntime:
             return state
 
     async def release_request(self, state: RequestState) -> None:
+        """Release the slot only when it still belongs to this request."""
         async with self.active_lock:
             if self.active is state:
                 self.active = None
 
     async def has_active_request(self) -> bool:
+        """Report whether chat or ingestion currently owns the slot."""
         async with self.active_lock:
             return self.active is not None
 
     async def cancel_active(self) -> bool:
+        """Signal and await the active pipeline without cancelling the caller."""
         async with self.active_lock:
             state = self.active
             if state is None:
@@ -70,12 +77,14 @@ def create_app(
     model_transport: httpx.AsyncBaseTransport | None = None,
     heartbeat_interval: float = 10.0,
 ) -> FastAPI:
+    """Construct the web app around replaceable settings and model transport."""
     configured = app_settings or default_settings
     static_dir = Path(__file__).parent / "static"
     template_path = Path(__file__).parent / "templates" / "index.html"
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        """Build live state at startup and close active work at shutdown."""
         configured.ensure_dirs()
         timeout = httpx.Timeout(
             connect=configured.http_connect_timeout,
@@ -133,6 +142,7 @@ def create_app(
 
     @app.get("/")
     async def index() -> FileResponse:
+        """Serve the single-page chat interface."""
         return FileResponse(template_path)
 
     @app.post("/api/chat")
@@ -140,6 +150,7 @@ def create_app(
         message: str = Form(...),
         file: UploadFile | None = File(None),
     ) -> StreamingResponse:
+        """Run optional ingestion and chat as one cancellable SSE request."""
         runtime = _runtime(app)
         request_state = await runtime.claim_request()
         if request_state is None:
@@ -159,6 +170,7 @@ def create_app(
         queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
 
         async def pipeline() -> None:
+            """Produce status, answer, and terminal events for the SSE stream."""
             try:
                 if request_state.cancel_event.is_set():
                     raise asyncio.CancelledError
@@ -195,6 +207,7 @@ def create_app(
                 await runtime.release_request(request_state)
 
         async def events():
+            """Forward queued events and cancel work when the client disconnects."""
             producer = asyncio.create_task(
                 pipeline(), name=f"chat-{request_state.request_id}"
             )
@@ -218,6 +231,7 @@ def create_app(
                 await asyncio.gather(producer, return_exceptions=True)
             finally:
                 async def cleanup() -> None:
+                    """Cancel and reap producer work before releasing its slot."""
                     request_state.cancel_event.set()
                     if not producer.done():
                         producer.cancel()
@@ -244,17 +258,20 @@ def create_app(
 
     @app.post("/api/stop")
     async def stop() -> JSONResponse:
+        """Cancel the active chat or ingestion pipeline."""
         cancelled = await _runtime(app).cancel_active()
         return JSONResponse({"status": "ok", "cancelled": cancelled})
 
     @app.get("/api/chat-history")
     async def history() -> JSONResponse:
+        """Return persisted user-visible chat messages."""
         return JSONResponse(
             {"history": [item.to_dict() for item in _runtime(app).live_history.value.messages]}
         )
 
     @app.post("/api/clear-chat")
     async def clear_chat() -> JSONResponse:
+        """Cancel active work and clear documents plus chat history."""
         runtime = _runtime(app)
         await runtime.cancel_active()
         runtime.documents.clear()
@@ -265,6 +282,7 @@ def create_app(
 
     @app.get("/api/documents")
     async def documents() -> JSONResponse:
+        """List committed document metadata."""
         return JSONResponse(
             {
                 "documents": [
@@ -280,6 +298,7 @@ def create_app(
 
     @app.delete("/api/documents/{file_id}")
     async def delete_document(file_id: str) -> JSONResponse:
+        """Delete one idle document transactionally."""
         runtime = _runtime(app)
         if await runtime.has_active_request():
             raise HTTPException(status_code=409, detail="A chat request is active")
@@ -289,6 +308,7 @@ def create_app(
 
     @app.get("/api/documents/{file_id}/download")
     async def download_document(file_id: str) -> FileResponse:
+        """Download a committed document by canonical ID."""
         runtime = _runtime(app)
         document = next(
             (
@@ -313,6 +333,7 @@ def create_app(
 
 
 def _runtime(app: FastAPI) -> ApplicationRuntime:
+    """Return initialized runtime state or an HTTP readiness error."""
     runtime: ApplicationRuntime | None = getattr(app.state, "runtime", None)
     if runtime is None:
         raise HTTPException(status_code=503, detail="Application is not ready")
@@ -320,6 +341,7 @@ def _runtime(app: FastAPI) -> ApplicationRuntime:
 
 
 def _sse(event: dict[str, object]) -> str:
+    """Encode one JSON value as a server-sent event."""
     return f"data: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\n\n"
 
 
@@ -327,6 +349,7 @@ app = create_app()
 
 
 def run() -> None:
+    """Run the local single-worker ASGI server."""
     import uvicorn
 
     uvicorn.run(app, host="127.0.0.1", port=8000, workers=1)

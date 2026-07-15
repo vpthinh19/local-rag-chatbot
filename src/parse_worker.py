@@ -22,21 +22,29 @@ _FILE_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 @dataclass(frozen=True, slots=True)
 class PageMarkdown:
+    """Markdown extracted from one physical document page."""
+
     page_num: int
     markdown: str
 
 
 @dataclass(frozen=True, slots=True)
 class _PageSpan:
+    """Character interval mapping joined Markdown back to a page."""
+
     start: int
     end: int
     page_num: int
 
 
 class _TokenCounter(Protocol):
+    """Minimal tokenizer contract needed to enforce chunk size."""
+
     def __call__(
         self, text: str, *, add_special_tokens: bool = False
-    ) -> int: ...
+    ) -> int:
+        """Count model tokens in text."""
+        ...
 
 
 def build_chunks(
@@ -47,6 +55,7 @@ def build_chunks(
     split_indices: Callable[[str], Sequence[tuple[int, str]]],
     token_count: _TokenCounter,
 ) -> list[Chunk]:
+    """Split joined page Markdown and attach source-page references."""
     document, spans = _join_pages(pages)
     if not document.strip() or not spans:
         raise DataValidationError("parsed document is empty")
@@ -70,6 +79,7 @@ def build_chunks(
         if token_count(text, add_special_tokens=False) > MAX_CHUNK_TOKENS:
             raise DataValidationError("chunk exceeds the 1024-token payload limit")
 
+        # Splitter offsets let citations survive whole-document chunking.
         first_page = _page_at(spans, offset)
         last_page = _page_at(spans, end - 1)
         reference = (
@@ -93,6 +103,7 @@ def parse_file(
     max_pages: int,
     tokenizer_name: str,
 ) -> list[Chunk]:
+    """Parse, chunk, and release all heavyweight worker-local objects."""
     parser = result = tokenizer = splitter = pages = None
     try:
         from liteparse import LiteParse
@@ -120,6 +131,7 @@ def parse_file(
         def count_tokens(
             text: str, *, add_special_tokens: bool = False
         ) -> int:
+            """Adapt the tokenizer encoding API to a token count."""
             return len(
                 tokenizer.encode(
                     text, add_special_tokens=add_special_tokens
@@ -134,10 +146,12 @@ def parse_file(
             token_count=count_tokens,
         )
     finally:
+        # Drop heavyweight references before the worker serializes output and exits.
         parser = result = tokenizer = splitter = pages = None
 
 
 def _load_splitter(tokenizer_name: str):
+    """Load the local tokenizer and token-bounded Markdown splitter."""
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     from semantic_text_splitter import MarkdownSplitter
     from tokenizers import Tokenizer
@@ -152,6 +166,7 @@ def _load_splitter(tokenizer_name: str):
 def _join_pages(
     pages: Sequence[PageMarkdown],
 ) -> tuple[str, list[_PageSpan]]:
+    """Join nonempty pages while recording their character intervals."""
     parts: list[str] = []
     spans: list[_PageSpan] = []
     cursor = 0
@@ -178,6 +193,7 @@ def _join_pages(
 
 
 def _page_at(spans: Sequence[_PageSpan], offset: int) -> int:
+    """Resolve a joined-document character offset to its source page."""
     starts = [span.start for span in spans]
     index = bisect_right(starts, offset) - 1
     if index < 0:
@@ -186,6 +202,7 @@ def _page_at(spans: Sequence[_PageSpan], offset: int) -> int:
 
 
 def _write_chunks(path: Path, chunks: list[Chunk]) -> None:
+    """Atomically publish validated worker output for the parent process."""
     serialized = json.dumps(
         {"chunks": [chunk.to_dict() for chunk in chunks]},
         ensure_ascii=False,
@@ -213,6 +230,7 @@ def _write_chunks(path: Path, chunks: list[Chunk]) -> None:
 def _validate_arguments(
     input_path: Path, output_path: Path, file_id: str, file_name: str
 ) -> None:
+    """Reject unsafe paths, identifiers, and unsupported file types."""
     if not input_path.is_file():
         raise DataValidationError("input file does not exist")
     if input_path.resolve() == output_path.resolve():
@@ -230,6 +248,7 @@ def _validate_arguments(
 
 
 def _parser() -> argparse.ArgumentParser:
+    """Build the disposable worker's command-line interface."""
     parser = argparse.ArgumentParser(description="Parse one staged document")
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
@@ -245,6 +264,7 @@ def main(
         [Path, str, str, int, str], list[Chunk]
     ] = parse_file,
 ) -> int:
+    """Run one parse job and report failures through exit status and stderr."""
     args = _parser().parse_args(argv)
     try:
         _validate_arguments(args.input, args.output, args.file_id, args.file_name)
