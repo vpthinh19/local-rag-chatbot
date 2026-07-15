@@ -69,6 +69,7 @@ class Settings:
 
     # Ingestion and retrieval budgets keep memory and prompt size predictable.
     max_upload_bytes: int = 25 * 1024 * 1024
+    max_message_chars: int = 12_000
     max_context_chars: int = 48_000
     embedding_batch_size: int = 32
     lexical_candidate_limit: int = 24
@@ -76,6 +77,7 @@ class Settings:
     fused_candidate_limit: int = 16
     final_chunk_limit: int = 5
     parse_termination_grace_seconds: float = 3.0
+    parse_timeout_seconds: float = 300.0
     max_parse_pages: int = 200
     tokenizer_name: str = "BAAI/bge-m3"
 
@@ -88,6 +90,7 @@ class Settings:
             "http_write_timeout": self.http_write_timeout,
             "http_pool_timeout": self.http_pool_timeout,
             "max_upload_bytes": self.max_upload_bytes,
+            "max_message_chars": self.max_message_chars,
             "max_context_chars": self.max_context_chars,
             "embedding_batch_size": self.embedding_batch_size,
             "lexical_candidate_limit": self.lexical_candidate_limit,
@@ -95,6 +98,7 @@ class Settings:
             "fused_candidate_limit": self.fused_candidate_limit,
             "final_chunk_limit": self.final_chunk_limit,
             "parse_termination_grace_seconds": self.parse_termination_grace_seconds,
+            "parse_timeout_seconds": self.parse_timeout_seconds,
             "max_parse_pages": self.max_parse_pages,
         }
         invalid = [name for name, value in numeric_limits.items() if value <= 0]

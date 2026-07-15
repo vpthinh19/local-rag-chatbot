@@ -313,3 +313,32 @@ def test_local_liteparse_fixture(fixture: Path) -> None:
 
     assert chunks
     assert all(chunk.text and chunk.refs for chunk in chunks)
+
+
+@pytest.mark.parse_integration
+@pytest.mark.skipif(
+    os.getenv("RUN_PARSE_INTEGRATION") != "1",
+    reason="set RUN_PARSE_INTEGRATION=1 for local LiteParse fixtures",
+)
+@pytest.mark.parametrize(
+    ("extension", "content"),
+    [
+        (".pdf", b"not a pdf"),
+        (".docx", b"PK\x03\x04not an office archive"),
+        (".png", b"not an image"),
+    ],
+)
+def test_local_liteparse_rejects_corrupt_input(
+    tmp_path: Path, extension: str, content: bytes
+) -> None:
+    fixture = tmp_path / f"broken{extension}"
+    fixture.write_bytes(content)
+
+    with pytest.raises(Exception):
+        worker.parse_file(
+            fixture,
+            file_id="integration",
+            file_name=fixture.name,
+            max_pages=200,
+            tokenizer_name="BAAI/bge-m3",
+        )

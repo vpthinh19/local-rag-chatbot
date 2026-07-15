@@ -120,6 +120,31 @@ async def test_successful_sse_has_request_status_content_and_done(
 
 
 @pytest.mark.asyncio
+async def test_invalid_message_is_rejected_before_upload_or_slot_claim(
+    tmp_path: Path,
+) -> None:
+    async with _client(tmp_path) as (app, client):
+        empty = await client.post(
+            "/api/chat",
+            data={"message": "  "},
+            files={"file": ("report.pdf", b"file", "application/pdf")},
+        )
+        oversized = await client.post(
+            "/api/chat",
+            data={
+                "message": "x"
+                * (app.state.runtime.settings.max_message_chars + 1)
+            },
+        )
+
+        assert empty.status_code == 400
+        assert oversized.status_code == 413
+        assert app.state.runtime.active is None
+        assert app.state.runtime.live_corpus.value == Corpus()
+        assert list(app.state.runtime.settings.uploads_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
 async def test_second_request_is_409_and_stop_clears_active_state(
     tmp_path: Path,
 ) -> None:

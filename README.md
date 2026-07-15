@@ -88,7 +88,8 @@ một quy trình Markdown, chunking, embedding và truy vấn RAG.
 Khả năng chuyển đổi thực tế còn phụ thuộc phiên bản LibreOffice/ImageMagick và
 nội dung file. Nếu converter hoặc parser thất bại, request trả lỗi và không ghi
 file, corpus hay index dở dang. Giới hạn mặc định là 25 MiB mỗi upload và 200
-trang sau chuyển đổi.
+trang sau chuyển đổi. Parser bị dừng tự động sau 5 phút nếu converter hoặc OCR
+không kết thúc; tin nhắn chat được giới hạn ở 12.000 ký tự.
 
 ## Cấu trúc source
 

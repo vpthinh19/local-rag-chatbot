@@ -152,6 +152,13 @@ def create_app(
     ) -> StreamingResponse:
         """Run optional ingestion and chat as one cancellable SSE request."""
         runtime = _runtime(app)
+        clean_message = message.strip()
+        if not clean_message:
+            raise HTTPException(
+                status_code=400, detail="Chat message must not be empty"
+            )
+        if len(clean_message) > configured.max_message_chars:
+            raise HTTPException(status_code=413, detail="Chat message is too long")
         request_state = await runtime.claim_request()
         if request_state is None:
             raise HTTPException(status_code=409, detail="Another chat request is active")
@@ -193,7 +200,7 @@ def create_app(
                     )
                 queue.put_nowait({"status": "Đang tạo câu trả lời..."})
                 async for content in runtime.chat.stream(
-                    message, new_document_id=new_document_id
+                    clean_message, new_document_id=new_document_id
                 ):
                     queue.put_nowait({"content": content})
                 queue.put_nowait({"done": True})

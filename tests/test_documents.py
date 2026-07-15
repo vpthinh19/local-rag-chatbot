@@ -190,6 +190,24 @@ async def test_cancelled_worker_group_is_killed_and_reaped(
     assert not any(Path(f"/proc/{pid}").exists() for pid in pids)
 
 
+@pytest.mark.asyncio
+async def test_timed_out_worker_group_is_killed_and_never_commits(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_PARSE_MODE", "wait")
+    object.__setattr__(harness.settings, "parse_timeout_seconds", 0.05)
+    state = RequestState("timeout-worker")
+
+    with pytest.raises(TimeoutError, match="timed out"):
+        await harness.service.ingest("a.pdf", b"content", state)
+
+    assert state.parse_process is None
+    assert harness.live.value == Corpus()
+    assert harness.rag.install_count == 0
+    assert list(harness.settings.uploads_dir.iterdir()) == []
+    assert not (harness.settings.staging_dir / state.request_id).exists()
+
+
 def signal_number(name: str) -> int:
     import signal
 

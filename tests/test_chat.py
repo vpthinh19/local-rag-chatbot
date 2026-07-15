@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from src.chat import ChatAgent, ChatProtocolError, LiveHistory
+from src.chat import ChatAgent, ChatProtocolError, FINAL_INSTRUCTION, LiveHistory
 from src.config import Settings
 from src.documents import LiveCorpus
 from src.llama import ContentEvent, ToolCallEvent
@@ -98,6 +98,31 @@ async def test_greeting_is_one_direct_model_call(tmp_path: Path) -> None:
         Message("assistant", "Xin chào!"),
     ]
     assert History.load(settings.history_path) == history.value
+
+
+@pytest.mark.asyncio
+async def test_empty_or_oversized_message_never_reaches_model(tmp_path: Path) -> None:
+    llama = FakeLlama([])
+    agent, history, rag, settings = _agent(tmp_path, llama)
+
+    with pytest.raises(ValueError, match="empty"):
+        await _collect(agent, "  ")
+    with pytest.raises(ValueError, match="size"):
+        await _collect(agent, "x" * (settings.max_message_chars + 1))
+
+    assert llama.calls == []
+    assert rag.calls == []
+    assert history.value == History()
+
+
+def test_agent_prompt_handles_typo_and_requires_exact_evidence(tmp_path: Path) -> None:
+    agent, _, _, _ = _agent(tmp_path, FakeLlama([]))
+
+    system = agent._first_messages("han nop ngafy nao", None)[0]["content"]
+
+    assert "không dấu hoặc sai chính tả nhẹ" in system
+    assert "phải dùng search" in system
+    assert "chép chính xác" in FINAL_INSTRUCTION
 
 
 @pytest.mark.asyncio

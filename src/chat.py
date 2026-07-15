@@ -81,6 +81,8 @@ TOOLS: list[dict[str, object]] = [
 
 FINAL_INSTRUCTION = (
     "Hãy trả lời yêu cầu ban đầu ngay bây giờ. Chỉ dùng dữ liệu trong tool result; "
+    "chép chính xác tên riêng, con số, ngày tháng và địa điểm, không thay thế bằng "
+    "kiến thức hay phỏng đoán. "
     "nếu là kết quả search thì thêm citation tên file và refs, nếu status là error "
     "thì hỏi người dùng làm rõ, nếu không có kết quả thì nói không tìm thấy và "
     "không suy đoán. Không gọi thêm công cụ."
@@ -117,6 +119,8 @@ class ChatAgent:
         user_message = message.strip()
         if not user_message:
             raise ValueError("chat message must not be empty")
+        if len(user_message) > self._settings.max_message_chars:
+            raise ValueError("chat message exceeds the size limit")
         messages = self._first_messages(user_message, new_document_id)
         content_parts: list[str] = []
         tool_calls: list[ToolCallEvent] = []
@@ -210,6 +214,9 @@ class ChatAgent:
             "Bạn là trợ lý tài liệu thân thiện. Trả lời trực tiếp lời chào, hội thoại "
             "thông thường và yêu cầu chỉ đọc/giữ file. Khi cần nội dung tài liệu, gọi "
             "đúng một công cụ: overview cho tóm tắt/dàn ý, search cho dữ kiện chi tiết. "
+            "Người dùng có thể viết tiếng Việt không dấu hoặc sai chính tả nhẹ; hãy suy "
+            "ra ý định. Khi họ hỏi dữ kiện và có tài liệu phù hợp, phải dùng search thay "
+            "vì hỏi lại có muốn tìm kiếm hay không. "
             "QUY TẮC PROTOCOL: nếu gọi công cụ, lượt đầu chỉ được chứa tool call; tuyệt "
             "đối không viết câu dẫn, giải thích hay content trước/sau tool call. "
             "Không tự bịa nội dung tài liệu. Sau search, trích dẫn ngắn bằng tên file "

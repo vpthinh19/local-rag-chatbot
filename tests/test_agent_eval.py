@@ -121,6 +121,7 @@ async def test_live_agent_decisions_and_final_protocol() -> None:
     choice_total = choice_correct = 0
     follow_total = follow_correct = 0
     empty_claims = 0
+    choice_misses: list[tuple[str, str]] = []
 
     with TemporaryDirectory() as directory:
         settings = Settings(data_dir=Path(directory) / "data")
@@ -159,6 +160,8 @@ async def test_live_agent_decisions_and_final_protocol() -> None:
                 if case.get("score_choice", True):
                     choice_total += 1
                     choice_correct += choice in case["expected_choices"]
+                    if choice not in case["expected_choices"]:
+                        choice_misses.append((case["id"], choice))
 
                 if call is None:
                     continue
@@ -224,6 +227,7 @@ async def test_live_agent_decisions_and_final_protocol() -> None:
             "choice_accuracy": choice_correct / choice_total,
             "followup_file_accuracy": follow_correct / follow_total,
             "empty_result_claims": empty_claims,
+            "choice_misses": choice_misses,
         }
     )
 

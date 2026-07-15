@@ -10,6 +10,8 @@
   {"id":"general-02","category":"direct","message":"Viết một câu chúc học tập tốt.","expected_choices":["direct"]},
   {"id":"general-03","category":"direct","message":"2 cộng 2 bằng bao nhiêu?","expected_choices":["direct"]},
   {"id":"general-04","category":"direct","message":"Bạn có thể trò chuyện thông thường không?","expected_choices":["direct"]},
+  {"id":"general-noise","category":"direct","message":"asdf qwer zxcv 123 ???","expected_choices":["direct"]},
+  {"id":"general-no-diacritics","category":"direct","message":"hom nay con meo nha toi ngu ca ngay :)))","expected_choices":["direct"]},
 
   {"id":"ack-01","category":"upload_ack","message":"Hãy đọc và giữ file này, chưa cần làm gì thêm.","new_document_id":"policy","expected_choices":["direct"]},
   {"id":"ack-02","category":"upload_ack","message":"Tôi gửi tài liệu để lát nữa hỏi, xác nhận đã nhận nhé.","new_document_id":"policy","expected_choices":["direct"]},
@@ -35,6 +37,8 @@
   {"id":"search-08","category":"search","message":"Tìm cả quy định cảnh báo học vụ và cách xử lý trong tài liệu hướng dẫn.","expected_choices":["search"],"expected_file_ids":["guide"]},
   {"id":"search-09","category":"search","message":"Kết quả tài chính và số lượng người tham gia trong báo cáo là bao nhiêu?","expected_choices":["search"],"expected_file_ids":["report"]},
   {"id":"search-10","category":"search","message":"Tài liệu nào nói rằng gắn kết cộng đồng là một trụ cột, và câu đó ở trang nào?","expected_choices":["search"],"expected_file_ids":["policy"]},
+  {"id":"search-no-diacritics","category":"search","message":"han dang ky hoc phan trong file huong dan la khi nao","expected_choices":["search"],"expected_file_ids":["guide"]},
+  {"id":"search-typo","category":"search","message":"canh bao hoc vu dc xu ly nhu nao trog tai lieu huog dan","expected_choices":["search"],"expected_file_ids":["guide"]},
 
   {"id":"compare-01","category":"comparison","message":"So sánh khái quát chính sách cộng đồng và hướng dẫn học vụ.","expected_choices":["overview"],"expected_file_ids":["policy","guide"]},
   {"id":"compare-02","category":"comparison","message":"So sánh mục tiêu chính của chinh-sach-cong-dong.pdf với bao-cao-2025.pdf.","expected_choices":["overview"],"expected_file_ids":["policy","report"]},

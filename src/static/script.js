@@ -236,7 +236,14 @@ const streamResponse = async (formData) => {
         });
         
         if (!response.ok) {
-            throw new Error(`Server error: ${response.status}`);
+            let detail = `Server error: ${response.status}`;
+            try {
+                const payload = await response.json();
+                if (typeof payload.detail === "string") detail = payload.detail;
+            } catch (_) {
+                // Keep the status fallback for non-JSON proxy errors.
+            }
+            throw new Error(detail);
         }
         
         if (!response.body) {

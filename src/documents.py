@@ -222,8 +222,13 @@ class DocumentService:
         cancel_task = asyncio.create_task(state.cancel_event.wait())
         try:
             done, _ = await asyncio.wait(
-                {wait_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED
+                {wait_task, cancel_task},
+                timeout=self._settings.parse_timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
             )
+            if not done:
+                await self._stop_worker_group(process)
+                raise TimeoutError("document parser timed out")
             if cancel_task in done and state.cancel_event.is_set():
                 await self._stop_worker_group(process)
                 raise asyncio.CancelledError
