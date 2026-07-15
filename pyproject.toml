@@ -23,3 +23,6 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+    "parse_integration: opt-in LiteParse/OCR checks against local document fixtures",
+]
