@@ -77,6 +77,13 @@ TOOLS: list[dict[str, object]] = [
     },
 ]
 
+FINAL_INSTRUCTION = (
+    "Hãy trả lời yêu cầu ban đầu ngay bây giờ. Chỉ dùng dữ liệu trong tool result; "
+    "nếu là kết quả search thì thêm citation tên file và refs, nếu status là error "
+    "thì hỏi người dùng làm rõ, nếu không có kết quả thì nói không tìm thấy và "
+    "không suy đoán. Không gọi thêm công cụ."
+)
+
 
 class ChatAgent:
     def __init__(
@@ -156,6 +163,7 @@ class ChatAgent:
                     "name": call.name,
                     "content": tool_result,
                 },
+                {"role": "user", "content": FINAL_INSTRUCTION},
             ]
         )
 

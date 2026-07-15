@@ -1,7 +1,7 @@
 [project]
 name = "chatbot"
-version = "2.1.1"
-description = "Local RAG Chatbot"
+version = "3.0.0"
+description = "Compact local RAG mini-agent"
 readme = "README.md"
 requires-python = "==3.12.*"
 dependencies = [
@@ -25,4 +25,5 @@ pythonpath = ["."]
 testpaths = ["tests"]
 markers = [
     "parse_integration: opt-in LiteParse/OCR checks against local document fixtures",
+    "live_model: opt-in checks against the running llama.cpp model servers",
 ]

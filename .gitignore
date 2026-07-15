@@ -40,8 +40,5 @@ ENV/
 
 # Project specific
 .worktrees/
-artifacts/*
-!artifacts/.placeholder
-custom_packages/*.whl
 models/*.gguf
 docs/*
