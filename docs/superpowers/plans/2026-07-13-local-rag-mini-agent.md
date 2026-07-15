@@ -2,17 +2,17 @@
 
 ## Goal
 
-Replace the legacy backend with a small FastAPI RAG agent that calls three persistent llama.cpp HTTP servers and spawns one disposable Docling subprocess per upload. Preserve the existing browser experience and JSON data while deleting the old model/service/cancellation architecture only after equivalent tests pass.
+Replace the legacy backend with a small FastAPI RAG agent that calls three persistent llama.cpp HTTP servers and spawns one disposable LiteParse subprocess group per upload. Preserve the existing browser experience and JSON data while deleting the old model/service/cancellation architecture only after equivalent tests pass.
 
 ## Implementation principles
 
 - Treat legacy code as contract/reference, not code to port class by class.
 - Keep one Uvicorn worker and one active chat pipeline.
-- Keep all persistent application state in FastAPI; isolate only Docling conversion/chunking.
+- Keep all persistent application state in FastAPI; isolate LiteParse, OCR, conversion, and Markdown chunking in one temporary worker.
 - Direct LLM answer or at most one read-only tool call per user turn.
 - Build candidate state before commit; cancel discards only uncommitted work.
 - Add no framework, queue, database, vector store, or generic abstraction without a demonstrated need.
-- Preserve current user changes to `test.py`, `test.txt`, `test.json`, `pyproject.toml`, `uv.lock`, and the README deletion unless a task explicitly brings a file into scope.
+- Preserve all unrelated user work in the dirty worktree unless a task explicitly brings a file into scope.
 - Use concise commits and the repository's configured human identity when commits are requested.
 
 ## Target structure
@@ -24,7 +24,7 @@ src/
   models.py
   llama.py
   rag.py
-  docling_worker.py
+  parse_worker.py
   documents.py
   chat.py
   templates/index.html
@@ -32,11 +32,11 @@ src/
   static/script.js
 tests/
   fixtures/agent_cases.json
-  helpers/fake_docling_worker.py
+  helpers/fake_parse_worker.py
   test_models.py
   test_llama.py
   test_rag.py
-  test_docling_worker.py
+  test_parse_worker.py
   test_documents.py
   test_chat.py
   test_api.py
@@ -60,22 +60,26 @@ The exact number of helper functions is implementation-driven. Do not create ext
 
 1. Add direct runtime dependencies used by production code:
    - `bm25s`
-   - `docling`
    - `fastapi[standard]`
    - `httpx`
+   - `liteparse`
    - `numpy`
-   - `torch`
+   - `semantic-text-splitter`
+   - `tokenizers`
 2. Add a dev dependency group containing `pytest` and `pytest-asyncio`.
-3. Confirm `llama-cpp-python`, `model2vec`, OpenAI SDK, agent frameworks, task queues, and vector databases are absent.
-4. Add preservation tests for the existing HTML control IDs and static assets.
-5. Add safety assertions that server/user filenames and message content are not interpolated into `innerHTML`. The current filename rendering is expected to fail until Task 8.
-6. Lock and sync the environment.
+3. Confirm `docling`, `torch`, `chonkie`, `llama-cpp-python`, `model2vec`, OpenAI SDK, agent frameworks, task queues, and vector databases are absent.
+4. Verify `libreoffice --headless --version` for DOCX conversion and prefetch `BAAI/bge-m3` through `Tokenizer.from_pretrained()` once during environment setup. Do not commit cache contents.
+5. Add preservation tests for the existing HTML control IDs and static assets.
+6. Add safety assertions that server/user filenames and message content are not interpolated into `innerHTML`. The current filename rendering is expected to fail until Task 8.
+7. Lock and sync the environment.
 
 ### Verification
 
 ```bash
 uv lock
 uv sync --group dev
+libreoffice --headless --version
+uv run python -c "from tokenizers import Tokenizer; Tokenizer.from_pretrained('BAAI/bge-m3')"
 uv run pytest tests/test_ui_assets.py -v
 ```
 
@@ -83,7 +87,7 @@ Record the known frontend safety failure; do not redesign the UI in this task.
 
 ### Completion condition
 
-The test runner works, production dependencies are explicit, and the lockfile contains no `llama-cpp-python`.
+The test runner works, production dependencies are explicit, and the lockfile contains none of the excluded parser/model/framework packages.
 
 ---
 
@@ -106,7 +110,8 @@ Do not delete `src/core` yet.
 - LLM/embed/rerank URLs;
 - HTTP timeouts;
 - upload/context/batch/candidate limits;
-- Docling termination grace time;
+- parse process-group termination grace time;
+- maximum parse pages and the BGE-M3 tokenizer identifier or local path;
 - `ensure_dirs()`.
 
 Derived paths must be properties or be computed in `__post_init__`, so replacing `data_dir` in tests also changes every dependent path.
@@ -263,19 +268,19 @@ The index has no model lifecycle or executor code and can prepare a new state be
 
 ---
 
-## Task 5: Implement the disposable Docling worker
+## Task 5: Implement the disposable LiteParse and chunking worker
 
 ### Files
 
-- Create `src/docling_worker.py`
-- Create `tests/test_docling_worker.py`
+- Create `src/parse_worker.py`
+- Create `tests/test_parse_worker.py`
 
 ### Worker contract
 
 Run as:
 
 ```bash
-python -m src.docling_worker \
+python -m src.parse_worker \
   --input <staged-path> \
   --output <chunks-json-path> \
   --file-id <opaque-id> \
@@ -285,31 +290,35 @@ python -m src.docling_worker \
 The worker:
 
 1. Validates explicit input/output arguments.
-2. Imports Docling only inside the worker module/process.
-3. Uses the exact `test.py` conversion configuration for PDF and DOCX.
-4. Contextualizes every emitted chunk and preserves all Docling refs.
-5. Writes plain DTO-compatible JSON to a temporary output and atomically replaces the requested result path.
-6. Writes errors to stderr and exits nonzero; it does not write a partial successful result.
-7. Drops Docling/document/chunk references in `finally`; process exit remains the guaranteed CUDA cleanup boundary.
+2. Imports LiteParse, `tokenizers`, and `semantic_text_splitter` only inside the worker module/process.
+3. Runs LiteParse locally with selective OCR, Tesseract language `vie+eng`, 150 DPI, Markdown output, the configured maximum page count, and very-small-text preservation disabled.
+4. Reads `page_num` and `page.markdown` from every parsed page, joins the document while recording each page's character span, and rejects an empty usable result.
+5. Resolves the `BAAI/bge-m3` tokenizer from the configured local path/cache. Missing tokenizer data is a controlled error; never fall back silently to character counts.
+6. Uses `MarkdownSplitter.from_huggingface_tokenizer(..., 1024, overlap=0)` and `chunk_indices()` over the full document, not one independent split per page.
+7. Maps each chunk's start/end offsets to deterministic page refs with `bisect`, builds stable DTO-compatible chunk IDs, and validates nonempty text and the 1024-token payload bound with special tokens excluded.
+8. Writes plain DTO-compatible JSON to a sibling temporary output and atomically replaces the requested result path.
+9. Writes bounded errors to stderr and exits nonzero; it does not write a partial successful result.
+10. Drops parser/page/Markdown/chunk references in `finally`; process-group exit remains the guaranteed native memory, OCR-thread, and converter-child cleanup boundary.
 
-Do not add progress IPC unless Docling already exposes a stable page callback with negligible code. Coarse status belongs to FastAPI.
+Do not add progress IPC. Coarse status and SSE heartbeats belong to FastAPI.
 
 ### Tests
 
-- Test CLI argument and output/error behavior without loading a real GPU model by monkeypatching a small conversion function.
-- Test chunk DTO construction, refs, Unicode, and output atomicity.
-- Add an opt-in integration test for one real DOCX/PDF fixture if a suitable non-sensitive fixture exists.
-- Assert `src.main`, `src.documents`, and other FastAPI modules do not import Docling conversion or CUDA cleanup APIs.
+- Test CLI argument and output/error behavior by monkeypatching a small parse function; the normal suite must not require LibreOffice, OCR, network access, or model weights.
+- Test synthetic multi-page Markdown spans, Unicode, chunks crossing page boundaries, offset-to-page refs, stable IDs, 1024-token limit, zero overlap, and output atomicity.
+- Use a small callback tokenizer in pure mapping tests and separately assert that production construction selects the configured BGE-M3 tokenizer.
+- Add opt-in/local integration checks for `docs/test.pdf` OCR and `docs/DACSN.docx`; never copy their contents into committed fixtures.
+- Assert `src.main`, `src.documents`, and other FastAPI modules do not import LiteParse, Tesseract, LibreOffice wrappers, `tokenizers`, or `semantic_text_splitter`.
 
 ### Verification
 
 ```bash
-uv run pytest tests/test_docling_worker.py -v
+uv run pytest tests/test_parse_worker.py -v
 ```
 
 ### Completion condition
 
-The worker can be launched independently and its only successful output is validated plain JSON.
+The worker can be launched independently, preserves page refs through structure-aware Markdown chunks, and its only successful output is validated plain JSON.
 
 ---
 
@@ -318,7 +327,7 @@ The worker can be launched independently and its only successful output is valid
 ### Files
 
 - Create `src/documents.py`
-- Create `tests/helpers/fake_docling_worker.py`
+- Create `tests/helpers/fake_parse_worker.py`
 - Create `tests/test_documents.py`
 
 ### Interface
@@ -332,17 +341,17 @@ The worker can be launched independently and its only successful output is valid
 - a small private subprocess runner method that tests can replace.
 
 Avoid a persistent job manager. The ingest coroutine owns one subprocess and awaits it directly.
-It is also the sole authority that terminates, kills, and reaps that process; active request state only exposes the current handle for cancellation coordination.
+It is also the sole authority that terminates, kills, and reaps that process group; active request state only exposes the current handle for cancellation coordination.
 
 ### Ingest implementation order
 
 1. Sanitize basename, validate extension/size, create request-scoped staging.
 2. Copy upload bytes without constructing a path from the client name.
-3. Emit/return the coarse `processing` status and spawn the worker with `asyncio.create_subprocess_exec` and no shell.
+3. Emit/return the coarse `processing` status and spawn the worker with `asyncio.create_subprocess_exec`, no shell, and `start_new_session=True` on the Linux target.
 4. Store the subprocess handle in the active request state.
-5. Await exit; on cancellation terminate, wait for the configured grace period, kill if necessary, and reap.
+5. Await exit; on cancellation signal the worker process group, wait for the configured grace period, kill the group if necessary, and reap the direct child.
 6. Validate worker exit code and chunks JSON.
-7. Clear the active subprocess handle; at this point Docling VRAM has been released.
+7. Clear the active subprocess handle; at this point LiteParse native memory, OCR threads, and converter children have been released.
 8. Generate a bounded overview through `LlamaClient`.
 9. Prepare new-vector/BM25 state through `RagIndex`.
 10. Build a candidate `Corpus`.
@@ -358,7 +367,7 @@ Use the fake worker to cover:
 1. Safe basename and accepted extensions.
 2. Successful process result and final commit.
 3. Worker nonzero exit and malformed JSON.
-4. Cancel while worker runs: terminate, then kill after grace when the fake ignores terminate.
+4. Cancel while worker runs: terminate its process group, then kill after grace when the fake worker and a fake grandchild ignore termination.
 5. Cancel during overview.
 6. Cancel during embedding/candidate preparation.
 7. Overview/embed/persistence failure rollback.
@@ -377,7 +386,7 @@ uv run pytest tests/test_documents.py -v
 
 ### Completion condition
 
-Every pre-commit failure leaves old persistent/live state intact, and every worker cancellation reaps its child process.
+Every pre-commit failure leaves old persistent/live state intact, and every worker cancellation reaps its direct child without leaving converter descendants.
 
 ---
 
@@ -520,7 +529,7 @@ Cover:
 - committed document survives agent cancel;
 - failed ingest never appears in `/api/documents`;
 - clear, delete, history, and download contracts;
-- no CUDA/model cleanup on stop/delete/clear/shutdown.
+- no parser, tokenizer, CUDA, or model cleanup in FastAPI on stop/delete/clear/shutdown.
 
 ### Verification
 
@@ -582,18 +591,18 @@ Add a small multilingual relevance fixture with obvious positive/negative docume
 
 ### Legacy removal
 
-Only after the model-free replacement suite passes:
+Only after the external-model-free replacement suite passes:
 
 1. Point the package entrypoint solely at the new app.
 2. Remove legacy API/core/services trees.
-3. Confirm there are no imports of `llama_cpp`, legacy cancellation types, model paths, CUDA cleanup, or legacy executors.
+3. Confirm there are no imports of `llama_cpp`, Docling/Torch, Chonkie/Model2Vec, legacy cancellation types, model paths, CUDA cleanup, or legacy executors.
 4. Preserve the existing corpus/history migration path.
 
 ### Automated verification
 
 ```bash
 uv run pytest -v
-rg -n "llama_cpp|LlamaEmbedding|CancellationToken|ThreadPoolExecutor|cuda\.empty_cache|cuda\.synchronize" src pyproject.toml
+rg -n "docling|torch|chonkie|model2vec|llama_cpp|LlamaEmbedding|CancellationToken|ThreadPoolExecutor|cuda\.empty_cache|cuda\.synchronize" src pyproject.toml
 python -m compileall -q src tests
 ```
 
@@ -603,24 +612,24 @@ The `rg` command should return no production match except a deliberate comment/t
 
 1. Start the three llama.cpp containers from the operational commands in `test.txt`.
 2. Start FastAPI with one Uvicorn worker.
-3. Upload a DOCX with acknowledgement and with a summary request.
-4. Upload a multi-page PDF and confirm UI/API responsiveness and SSE heartbeats.
-5. Observe that the Docling child exits and VRAM drops before overview/embedding starts.
+3. Upload `docs/DACSN.docx` with acknowledgement and with a summary request; verify LibreOffice conversion, readable Markdown, and page refs.
+4. Upload the image-only `docs/test.pdf`; verify selective Vietnamese/English OCR, UI/API responsiveness, and SSE heartbeats.
+5. Observe that the LiteParse process group exits and RAM is reclaimed before overview/embedding starts; model-server VRAM must remain effectively unchanged during parsing.
 6. Ask direct, overview, specific, comparison, and follow-up questions.
-7. Stop during Docling, overview, embedding, and answer streaming.
+7. Stop during LiteParse/OCR, overview, embedding, and answer streaming; confirm no LibreOffice/converter process remains.
 8. Confirm pre-commit cancel leaves no document and post-commit cancel preserves it.
 9. Download/delete a document; clear chat; restart FastAPI and confirm rebuild.
 10. Run the live agent fixture and reranker calibration.
 
 ### Completion condition
 
-The model-free suite passes, live acceptance targets pass, Docling cleanup is observed, legacy code is gone, and the final diff contains only files intentionally included in the refactor.
+The external-model-free suite passes, live acceptance targets pass, LiteParse/OCR quality and process-group cleanup are observed, legacy code is gone, and the final diff contains only files intentionally included in the refactor.
 
 ---
 
 ## Recommended execution order
 
-Execute Tasks 1–9 in order. Do not begin API replacement before persistence, HTTP protocol, RAG candidate state, Docling process cleanup, and agent behavior have focused tests.
+Execute Tasks 1–9 in order. Do not begin API replacement before persistence, HTTP protocol, RAG candidate state, LiteParse process-group cleanup, and agent behavior have focused tests.
 
 At each task:
 
@@ -633,10 +642,10 @@ At each task:
 ## Final guardrails
 
 - Do not introduce multi-user or multi-request behavior.
-- Do not add a Docling daemon, queue, or job database.
+- Do not add a parser daemon, queue, or job database.
 - Do not let the LLM poll processing status.
 - Do not let the LLM mutate files or chat state.
 - Do not persist partial answers or request-local RAG/tool data.
 - Do not interrupt the atomic commit section.
-- Do not keep Docling alive after chunk JSON is complete.
+- Do not keep LiteParse, its worker, or converter children alive after chunk JSON is complete.
 - Prefer a few readable concrete functions over reusable abstractions that have only one caller.

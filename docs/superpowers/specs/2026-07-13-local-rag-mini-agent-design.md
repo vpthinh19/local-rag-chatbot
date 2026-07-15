@@ -12,8 +12,9 @@ The result is a single-user pet project. Simplicity, predictable cleanup, and re
 
 Included:
 
-- PDF and DOCX ingestion with the Docling conversion/chunking behavior proven in `test.py`.
-- A fresh Docling subprocess for each upload, terminated after contextualized chunks have been produced.
+- Local PDF and DOCX ingestion through LiteParse, including selective Tesseract OCR for scanned/image content.
+- Markdown-aware chunking through `semantic-text-splitter` with the BGE-M3 tokenizer.
+- A fresh parse subprocess for each upload, terminated after page-aware chunks have been produced.
 - Three independently hosted `llama.cpp` HTTP services for generation, embeddings, and reranking.
 - A read-only LLM agent that either answers directly or calls at most one document tool.
 - BM25 plus embedding retrieval, reciprocal-rank fusion, and bounded reranking.
@@ -26,6 +27,7 @@ Excluded:
 - Redis, Celery, a persistent job queue, a database, or a vector database.
 - Agent frameworks, workflow graphs, generic tool registries, or open-ended tool loops.
 - Web search, arbitrary code execution, filesystem tools, or destructive LLM tools.
+- Cloud document parsing, managed ingestion, or managed retrieval APIs.
 - Persistent embedding vectors in the first version.
 - Resuming a chat generation after a browser disconnect.
 
@@ -44,7 +46,9 @@ During document conversion there is one additional temporary process:
 
 | Process | Lifetime | Responsibility |
 | --- | --- | --- |
-| Docling worker | One upload, from convert through contextualized chunk output | Read PDF/DOCX, convert, chunk, preserve refs, write plain JSON result, exit |
+| Parse worker | One upload, from LiteParse through Markdown chunk output | Read PDF/DOCX, run selective OCR, chunk, preserve page refs, write plain JSON result, exit |
+
+LiteParse may use OCR threads and short-lived converter children such as LibreOffice. These are implementation details inside the temporary worker lifecycle, not persistent application services.
 
 The app must run with one Uvicorn worker. Multiple workers would duplicate the in-memory corpus/index and cancellation state.
 
@@ -61,7 +65,7 @@ src/
   models.py           # DTOs and atomic corpus/history JSON persistence
   llama.py            # one shared HTTPX client and llama.cpp protocols
   rag.py              # BM25, normalized vectors, fusion, reranking
-  docling_worker.py   # subprocess entrypoint: convert and chunk one file
+  parse_worker.py     # subprocess entrypoint: LiteParse and chunk one file
   documents.py        # staging, worker lifecycle, ingest transaction, delete/clear
   chat.py             # prompts, two tools, validation, one-tool agent loop
 ```
@@ -77,6 +81,8 @@ Retain explicit boundary DTOs:
 - `Corpus(documents, chunks)`
 - `Message(role, content)` where role is only `user` or `assistant`
 - `AgentToolCall(name, arguments, call_id)` as a request-local value
+
+For new ingests, `Chunk.refs` contains a compact deterministic page or page-range reference derived from LiteParse page spans, for example `p. 4` or `pp. 4-5`. Existing opaque legacy refs remain readable during corpus migration.
 
 Paths:
 
@@ -102,11 +108,11 @@ The active request state contains only:
 - a request ID;
 - a cancellation event;
 - the current pipeline task;
-- the Docling subprocess handle when one exists.
+- the parse subprocess handle when one exists.
 
 There is no durable job registry or multi-job queue. SSE emits coarse real states and periodic heartbeats while a long PDF is processed.
 
-The ingest coroutine is the sole owner of Docling process cleanup. The handle in active request state is for visibility and cancellation coordination, not a second process manager.
+The ingest coroutine is the sole owner of parse process-group cleanup. The handle in active request state is for visibility and cancellation coordination, not a second process manager.
 
 ## 7. Document ingestion
 
@@ -114,12 +120,17 @@ The ingest coroutine is the sole owner of Docling process cleanup. The handle in
 
 1. Validate a nonempty `.pdf` or `.docx` basename and generate opaque request/document IDs.
 2. Copy the upload into a request-scoped staging directory. Never form a path directly from an unsanitized client filename.
-3. Spawn `python -m src.docling_worker` with explicit input, output, filename, and file-ID arguments. Do not use a shell.
+3. Spawn `python -m src.parse_worker` with explicit input, output, filename, and file-ID arguments. Do not use a shell. On the Linux target, use `start_new_session=True` so cancellation can terminate the worker and any LibreOffice/ImageMagick children as one process group.
 4. Await the subprocess asynchronously so the FastAPI event loop remains responsive.
-5. The worker follows `test.py`: `PdfPipelineOptions` with OCR off, `PyPdfiumDocumentBackend`, `MsWordDocumentBackend`, markdown-table serialization, `HybridChunker(merge_peers=True, always_emit_headings=True)`, refs from `DocChunk`, and contextualized text.
-6. The worker writes only plain chunk JSON and exits. Its process exit destroys the Docling CUDA context and releases its VRAM before summary or embedding begins.
+5. The worker runs LiteParse locally with selective OCR enabled, Tesseract language `vie+eng`, 150 DPI, Markdown output, a bounded page limit, and very-small-text preservation disabled. PDF parsing uses PDFium; non-PDF conversion may use system tools such as LibreOffice.
+6. For every `ParsedPage`, retain `page_num` and `page.markdown`. Concatenate page Markdown while recording its character span.
+7. Load the `BAAI/bge-m3` tokenizer and run `MarkdownSplitter.from_huggingface_tokenizer` with a maximum of 1024 tokens and zero overlap over the full Markdown document.
+8. Use `chunk_indices()` offsets plus the recorded page spans to assign deterministic start/end page refs without chunking each page independently.
+9. The worker writes only validated plain chunk JSON atomically and exits. Process exit releases its native parser, OCR threads, converter children, and working memory before overview or embedding begins.
 
-The FastAPI process does not import or initialize Docling conversion components. `torch.cuda.empty_cache()` in FastAPI is unnecessary. The worker may perform best-effort local cleanup, but process exit is the actual resource boundary.
+The FastAPI process does not import or initialize LiteParse, Tesseract, LibreOffice conversion, or tokenizer/chunking components. LiteParse does not use the model-server VRAM; process-group exit is the deterministic CPU/RAM and child-process cleanup boundary. No Torch or CUDA cleanup exists in the application.
+
+The tokenizer asset is resolved during environment setup and reused from the local Hugging Face cache. An unavailable tokenizer is a controlled worker/setup error rather than a silent switch to character counting.
 
 ### 7.2 Finalization and commit
 
@@ -148,7 +159,7 @@ The rule is: discard work that has not committed; preserve state that has commit
 
 | Cancellation phase | Action | Persistent result |
 | --- | --- | --- |
-| Docling running | terminate, wait briefly, kill if needed, reap, remove staging | Existing corpus/history unchanged |
+| Parse worker running | signal its process group, wait briefly, kill the group if needed, reap, remove staging | Existing corpus/history unchanged |
 | Overview request | cancel/close HTTP request, remove staging | Existing corpus/history unchanged |
 | Embedding request | cancel/close HTTP request, discard candidate state, remove staging | Existing corpus/history unchanged |
 | Commit section | finish the short atomic commit, then stop | New document remains persisted |
@@ -270,17 +281,20 @@ All server/user-derived content, including filenames and attachment names, is re
 Direct runtime dependencies:
 
 - `fastapi[standard]`
-- `docling`
+- `liteparse`
+- `semantic-text-splitter`
+- `tokenizers`
 - `bm25s`
 - `numpy`
 - `httpx`
-- `torch` only insofar as Docling requires it
 
-Development dependencies are `pytest` and `pytest-asyncio`. Do not add `llama-cpp-python`, OpenAI SDK, an agent framework, a task queue, or a vector database.
+Development dependencies are `pytest` and `pytest-asyncio`. Do not add `docling`, `torch`, `chonkie`, `model2vec`, `llama-cpp-python`, OpenAI SDK, an agent framework, a task queue, or a vector database.
 
-Configuration exposes paths; `LLM_URL`, `EMBED_URL`, and `RERANK_URL`; HTTP timeouts; embedding batch size; lexical/semantic/candidate/final limits; worker termination grace time; and maximum upload/context sizes.
+Configuration exposes paths; `LLM_URL`, `EMBED_URL`, and `RERANK_URL`; HTTP timeouts; embedding batch size; lexical/semantic/candidate/final limits; worker termination grace time; maximum upload/pages/context sizes; and the BGE-M3 tokenizer identifier or local tokenizer path. LiteParse parsing/chunking defaults remain a small fixed production policy rather than a public matrix of tuning knobs.
 
 Model file paths and CUDA flags belong only to the container commands, not application configuration.
+
+LibreOffice is a system prerequisite for DOCX conversion, not a Python dependency. Its absence produces a clear ingestion error and never mutates committed state.
 
 ## 14. Acceptance criteria
 
@@ -288,7 +302,7 @@ Automated tests cover:
 
 1. DTO migration and atomic corpus/history persistence.
 2. Safe upload names and staging cleanup.
-3. Successful worker result, worker failure, terminate/kill cancellation, and no Docling import in FastAPI modules.
+3. LiteParse page-to-chunk mapping, Markdown token bound, successful worker output, worker failure, process-group terminate/kill cancellation, and no parser/chunker import in FastAPI modules.
 4. Rollback before commit and persistence after cancel during agent generation.
 5. Startup orphan pruning and embedding rebuild.
 6. Batch embeddings, filtered hybrid retrieval, reranking index mapping, and new-chunks-only embedding.
@@ -299,14 +313,15 @@ Automated tests cover:
 
 A Vietnamese live fixture contains 40–60 representative cases. Targets are 100% valid tool protocol after allowed normalization, at least 95% correct direct/tool choice, at least 90% correct document selection in follow-ups, and zero unsupported document claims after empty retrieval.
 
-Release verification includes a real PDF and DOCX ingest, observing that the Docling process exits and its VRAM is released before summary/embedding, cancellation in each major phase, restart rebuild, document operations, and live tool-call/final-answer behavior against the actual Gemma and BGE llama.cpp containers.
+Release verification includes the image-only `docs/test.pdf` and the representative `docs/DACSN.docx`, observing OCR/page refs/chunk sizes, process-group exit and RAM cleanup before overview/embedding, unchanged model-server VRAM during parsing, cancellation in each major phase, restart rebuild, document operations, and live tool-call/final-answer behavior against the actual Gemma and BGE llama.cpp containers.
 
 ## 15. Final decisions
 
-- Four persistent logical processes; one temporary Docling process only during ingestion.
+- Four persistent logical processes; one temporary LiteParse worker only during ingestion.
 - Exactly one active chat pipeline and one Uvicorn worker.
 - No job queue or LLM progress tool.
-- Subprocess exit, not `empty_cache()` in FastAPI, is the Docling VRAM boundary.
+- LiteParse, Markdown splitting, OCR, and converter children remain inside the temporary process group; its exit is the cleanup boundary.
+- Markdown is split as one document at 1024 BGE-M3 tokens with zero overlap, then chunk offsets are mapped back to page ranges.
 - Direct answer or at most one of two read-only tools.
 - Uncommitted work is discarded on cancel; committed documents/history remain.
 - Existing UI and JSON persistence are retained and cleaned up, not redesigned.
