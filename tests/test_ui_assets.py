@@ -1,9 +1,6 @@
 from html.parser import HTMLParser
 from pathlib import Path
 
-import pytest
-
-
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "src" / "templates" / "index.html"
 SCRIPT = ROOT / "src" / "static" / "script.js"
@@ -71,10 +68,6 @@ def test_saved_and_submitted_messages_use_text_content() -> None:
     assert 'textContent = fullResponse' in script
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Task 8 will replace filename interpolation with DOM properties",
-)
 def test_filenames_are_not_interpolated_into_inner_html() -> None:
     script = SCRIPT.read_text(encoding="utf-8")
 

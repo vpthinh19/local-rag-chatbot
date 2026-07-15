@@ -129,21 +129,27 @@ const loadDocuments = async () => {
                 docItem.innerHTML = `
                     <div class="doc-header">
                         <span class="material-symbols-rounded doc-icon">description</span>
-                        <span class="doc-name" title="${doc.file_name}">${doc.file_name}</span>
+                        <span class="doc-name"></span>
                         <div class="doc-actions">
                             <button class="download-doc-btn material-symbols-rounded" 
-                                    data-file-id="${doc.file_id}" 
-                                    data-file-name="${doc.file_name}"
                                     title="Tải xuống">download</button>
                             <button class="delete-doc-btn material-symbols-rounded" 
-                                    data-file-id="${doc.file_id}"
                                     title="Xóa">close</button>
                         </div>
                     </div>
                     <div class="doc-meta">
-                        <span class="doc-chunks">${doc.chunk_count} chunks</span>
+                        <span class="doc-chunks"></span>
                     </div>
                 `;
+                const docName = docItem.querySelector('.doc-name');
+                const downloadBtn = docItem.querySelector('.download-doc-btn');
+                const deleteBtn = docItem.querySelector('.delete-doc-btn');
+                docName.textContent = doc.file_name;
+                docName.title = doc.file_name;
+                downloadBtn.dataset.fileId = doc.file_id;
+                downloadBtn.dataset.fileName = doc.file_name;
+                deleteBtn.dataset.fileId = doc.file_id;
+                docItem.querySelector('.doc-chunks').textContent = `${doc.chunk_count} chunks`;
                 documentsList.appendChild(docItem);
             }
             
@@ -380,7 +386,10 @@ const handleFormSubmit = async (e) => {
     if (uploadedFile) {
         const fileAttachment = document.createElement('p');
         fileAttachment.className = 'file-attachment';
-        fileAttachment.innerHTML = `<span class="material-symbols-rounded">description</span>${uploadedFile.name}`;
+        const fileIcon = document.createElement('span');
+        fileIcon.className = 'material-symbols-rounded';
+        fileIcon.textContent = 'description';
+        fileAttachment.append(fileIcon, document.createTextNode(uploadedFile.name));
         userMsgDiv.appendChild(fileAttachment);
     }
     
@@ -415,7 +424,7 @@ stopResponseBtn.addEventListener("click", async () => {
         abortController = null;
     }
     
-    // Call server to stop processing and release VRAM
+    // Ask the server to cancel the active request pipeline.
     try {
         await fetch('/api/stop', { method: 'POST' });
     } catch (e) {
@@ -435,6 +444,7 @@ stopResponseBtn.addEventListener("click", async () => {
     }
     
     cleanupRequest();
+    loadDocuments();
 });
 
 // File input
