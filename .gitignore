@@ -42,3 +42,5 @@ ENV/
 .worktrees/
 models/*.gguf
 docs/*
+data/*
+!data/.gitkeep

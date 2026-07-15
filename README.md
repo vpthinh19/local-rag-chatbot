@@ -277,6 +277,9 @@ Application:
 uv run python -m src.main
 ```
 
+File upload, corpus đã xử lý và lịch sử chat được lưu trong `data/`. Git chỉ giữ
+`data/.gitkeep`; toàn bộ dữ liệu runtime bên trong thư mục này được ignore.
+
 ## Kiểm thử
 
 ```bash
