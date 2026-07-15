@@ -1,0 +1,73 @@
+services:
+  llm:
+    container_name: llm
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda13
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./models:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      --model /models/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf
+      --model-draft /models/mtp-gemma-4-E4B-it.gguf
+      --n-gpu-layers -1
+      --ctx-size 32768
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      --spec-type draft-mtp
+      --spec-draft-n-max 4
+      --flash-attn on
+      --reasoning off
+      --temperature 0.1
+      --backend-sampling
+      --offline
+    restart: unless-stopped
+
+  embed:
+    container_name: embed
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda13
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./models:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      --model /models/bge-m3-Q8_0.gguf
+      --n-gpu-layers -1
+      --embedding
+      --pooling cls
+      --offline
+    restart: unless-stopped
+
+  rerank:
+    container_name: rerank
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda13
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./models:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      --model /models/bge-reranker-v2-m3-Q8_0.gguf
+      --n-gpu-layers -1
+      --reranking
+      --offline
+    restart: unless-stopped
