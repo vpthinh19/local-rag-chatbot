@@ -251,6 +251,15 @@ def test_fastapi_side_modules_do_not_import_parser_stack() -> None:
         assert not any(name in source for name in banned), path
 
 
+def test_model_server_microbatches_cover_the_chunk_token_limit() -> None:
+    compose = Path("docker-compose.yaml").read_text(encoding="utf-8")
+    embed = compose.split("  embed:", 1)[1].split("  rerank:", 1)[0]
+    rerank = compose.split("  rerank:", 1)[1]
+
+    assert "--ubatch-size 2048" in embed
+    assert "--ubatch-size 2048" in rerank
+
+
 @pytest.mark.parse_integration
 @pytest.mark.skipif(
     os.getenv("RUN_PARSE_INTEGRATION") != "1",

@@ -113,6 +113,12 @@ class RagIndex:
         )
         return self._make_state(chunks, vectors)
 
+    def prepare_clear(self) -> _IndexState:
+        dimension = self._state.vectors.shape[1]
+        return self._make_state(
+            (), np.empty((0, dimension), dtype=np.float32)
+        )
+
     def install(self, candidate_state: _IndexState) -> None:
         if not isinstance(candidate_state, _IndexState):
             raise TypeError("candidate_state was not prepared by RagIndex")

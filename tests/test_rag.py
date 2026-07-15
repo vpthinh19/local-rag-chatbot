@@ -94,6 +94,19 @@ async def test_prepare_remove_does_not_mutate_live_state(corpus: Corpus) -> None
 
 
 @pytest.mark.asyncio
+async def test_prepare_clear_waits_for_install(corpus: Corpus) -> None:
+    index = _index(FakeLlama())
+    await index.rebuild(corpus)
+
+    candidate = index.prepare_clear()
+
+    assert index.chunk_count == 4
+    index.install(candidate)
+    assert index.chunk_count == 0
+    assert index.vector_shape == (0, 2)
+
+
+@pytest.mark.asyncio
 async def test_file_filter_is_applied_before_reranking(corpus: Corpus) -> None:
     llama = FakeLlama()
     index = _index(llama)

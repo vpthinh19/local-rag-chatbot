@@ -48,6 +48,7 @@ services:
       --n-gpu-layers -1
       --embedding
       --pooling cls
+      --ubatch-size 2048
       --offline
     restart: unless-stopped
 
@@ -69,5 +70,6 @@ services:
       --model /models/bge-reranker-v2-m3-Q8_0.gguf
       --n-gpu-layers -1
       --reranking
+      --ubatch-size 2048
       --offline
     restart: unless-stopped
