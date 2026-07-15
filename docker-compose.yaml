@@ -26,6 +26,7 @@ services:
       --reasoning off
       --temperature 0.1
       --backend-sampling
+      --no-mmap
       --offline
     restart: unless-stopped
 
@@ -49,6 +50,7 @@ services:
       --embedding
       --pooling cls
       --ubatch-size 2048
+      --no-mmap
       --offline
     restart: unless-stopped
 
@@ -71,5 +73,6 @@ services:
       --n-gpu-layers -1
       --reranking
       --ubatch-size 2048
+      --no-mmap
       --offline
     restart: unless-stopped
