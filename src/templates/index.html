@@ -5,6 +5,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>AI Chatbot</title>
+    <link rel="icon" href="data:," />
     <link rel="stylesheet"
         href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@32,400,0,0" />
     <link rel="stylesheet" href="/static/style.css" />
@@ -17,7 +18,8 @@
             <div class="sidebar-header">
                 <span class="material-symbols-rounded">folder_open</span>
                 <span>Tài liệu</span>
-                <button id="toggle-sidebar-btn" class="material-symbols-rounded">chevron_left</button>
+                <button id="toggle-sidebar-btn" class="material-symbols-rounded"
+                    title="Thu gọn danh sách tài liệu" aria-label="Thu gọn danh sách tài liệu">chevron_left</button>
             </div>
             <div class="documents-list" id="documents-list">
                 <!-- Documents will be loaded here -->
@@ -39,21 +41,30 @@
                                 <!-- File Upload Wrapper -->
                                 <div class="file-upload-wrapper">
                                     <img src="#" class="file-preview" />
-                                    <input id="file-input" type="file" accept=".pdf,.docx" hidden />
-                                    <button type="button" class="file-icon material-symbols-rounded">description</button>
-                                    <button id="cancel-file-btn" type="button" class="material-symbols-rounded">close</button>
+                                    <input id="file-input" type="file"
+                                        accept=".pdf,.doc,.docx,.docm,.odt,.rtf,.pages,.ppt,.pptx,.pptm,.odp,.key,.xls,.xlsx,.xlsm,.ods,.csv,.tsv,.numbers,.jpg,.jpeg,.png,.gif,.bmp,.tiff,.webp,.svg"
+                                        hidden />
+                                    <button type="button" class="file-icon material-symbols-rounded"
+                                        aria-label="Tài liệu đã chọn">description</button>
+                                    <button id="cancel-file-btn" type="button" class="material-symbols-rounded"
+                                        title="Bỏ tài liệu đã chọn" aria-label="Bỏ tài liệu đã chọn">close</button>
                                     <button id="add-file-btn" type="button"
-                                        class="material-symbols-rounded">attach_file</button>
+                                        class="material-symbols-rounded" title="Đính kèm tài liệu"
+                                        aria-label="Đính kèm tài liệu">attach_file</button>
                                 </div>
                                 <!-- Send Prompt and Stop Response Buttons -->
                                 <button id="stop-response-btn" type="button"
-                                    class="material-symbols-rounded">stop_circle</button>
-                                <button id="send-prompt-btn" class="material-symbols-rounded">arrow_upward</button>
+                                    class="material-symbols-rounded" title="Dừng xử lý"
+                                    aria-label="Dừng xử lý">stop_circle</button>
+                                <button id="send-prompt-btn" class="material-symbols-rounded"
+                                    title="Gửi tin nhắn" aria-label="Gửi tin nhắn">arrow_upward</button>
                             </div>
                         </form>
                         <!-- Theme and Delete Chats Buttons -->
-                        <button id="theme-toggle-btn" class="material-symbols-rounded">light_mode</button>
-                        <button id="delete-chats-btn" class="material-symbols-rounded">delete</button>
+                        <button id="theme-toggle-btn" class="material-symbols-rounded"
+                            title="Đổi giao diện sáng hoặc tối" aria-label="Đổi giao diện sáng hoặc tối">light_mode</button>
+                        <button id="delete-chats-btn" class="material-symbols-rounded"
+                            title="Xóa lịch sử và tài liệu" aria-label="Xóa lịch sử và tài liệu">delete</button>
                     </div>
                 </div>
             </div>

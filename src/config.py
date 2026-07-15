@@ -7,6 +7,37 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
+# LiteParse converts office files with LibreOffice and images with ImageMagick.
+PDF_EXTENSIONS = frozenset({".pdf"})
+OFFICE_EXTENSIONS = frozenset(
+    {
+        ".csv",
+        ".doc",
+        ".docm",
+        ".docx",
+        ".key",
+        ".numbers",
+        ".odp",
+        ".ods",
+        ".odt",
+        ".pages",
+        ".ppt",
+        ".pptm",
+        ".pptx",
+        ".rtf",
+        ".tsv",
+        ".xls",
+        ".xlsm",
+        ".xlsx",
+    }
+)
+IMAGE_EXTENSIONS = frozenset(
+    {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".tiff", ".webp"}
+)
+SUPPORTED_DOCUMENT_EXTENSIONS = (
+    PDF_EXTENSIONS | OFFICE_EXTENSIONS | IMAGE_EXTENSIONS
+)
+
 
 def _url_from_env(name: str, default: str) -> str:
     """Read a service URL without a trailing slash."""

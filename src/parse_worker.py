@@ -12,7 +12,7 @@ import sys
 import tempfile
 from typing import Protocol
 
-from src.config import settings
+from src.config import SUPPORTED_DOCUMENT_EXTENSIONS, settings
 from src.models import Chunk, DataValidationError
 
 
@@ -242,7 +242,7 @@ def _validate_arguments(
         or Path(file_name).name != file_name
         or "/" in file_name
         or "\\" in file_name
-        or Path(file_name).suffix.lower() not in {".pdf", ".docx"}
+        or Path(file_name).suffix.lower() not in SUPPORTED_DOCUMENT_EXTENSIONS
     ):
         raise DataValidationError("display filename is unsafe or unsupported")
 

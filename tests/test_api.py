@@ -206,7 +206,7 @@ async def test_upload_status_order_and_committed_document(
             "done",
         ]
         assert "Đang xử lý" in events[1]["status"]
-        assert "Đã xử lý report.pdf" in events[2]["status"]
+        assert events[2]["status"] == "Đã xử lý report.pdf (1 đoạn)"
         assert (await client.get("/api/documents")).json()["documents"][0]["file_id"] == "new"
 
 

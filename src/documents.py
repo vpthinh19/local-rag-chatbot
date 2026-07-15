@@ -14,7 +14,7 @@ import sys
 from typing import Any, Awaitable, TypeVar
 from uuid import uuid4
 
-from src.config import Settings
+from src.config import SUPPORTED_DOCUMENT_EXTENSIONS, Settings
 from src.llama import LlamaClient
 from src.models import Chunk, Corpus, DataValidationError, Document
 from src.rag import RagIndex
@@ -386,8 +386,11 @@ class DocumentService:
             raise DataValidationError("upload filename is empty")
         if len(basename) > 180:
             raise DataValidationError("upload filename is too long")
-        if Path(basename).suffix.lower() not in {".pdf", ".docx"}:
-            raise DataValidationError("only PDF and DOCX uploads are supported")
+        if Path(basename).suffix.lower() not in SUPPORTED_DOCUMENT_EXTENSIONS:
+            supported = ", ".join(sorted(SUPPORTED_DOCUMENT_EXTENSIONS))
+            raise DataValidationError(
+                f"định dạng file không được hỗ trợ; định dạng hợp lệ: {supported}"
+            )
         return basename
 
     def _upload_path(self, file_id: str, file_name: str) -> Path:

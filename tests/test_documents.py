@@ -5,7 +5,7 @@ import sys
 
 import pytest
 
-from src.config import Settings
+from src.config import SUPPORTED_DOCUMENT_EXTENSIONS, Settings
 from src.documents import DocumentService, LiveCorpus, RequestState
 from src.models import Chunk, Corpus, DataValidationError, Document
 
@@ -117,6 +117,13 @@ async def test_successful_ingest_sanitizes_and_commits(
     assert uploads[0].name == f"{document.file_id}_{expected}"
     assert uploads[0].read_bytes() == b"content"
     assert not (harness.settings.staging_dir / state.request_id).exists()
+
+
+@pytest.mark.parametrize("extension", sorted(SUPPORTED_DOCUMENT_EXTENSIONS))
+def test_safe_name_accepts_every_liteparse_extension(extension: str) -> None:
+    assert DocumentService._safe_name(f"Tài liệu{extension.upper()}") == (
+        f"Tài liệu{extension.upper()}"
+    )
 
 
 @pytest.mark.asyncio

@@ -187,7 +187,7 @@ def create_app(
                         {
                             "status": (
                                 f"Đã xử lý {document.file_name} "
-                                f"({document.chunk_count} chunks)"
+                                f"({document.chunk_count} đoạn)"
                             )
                         }
                     )

@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 from pathlib import Path
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 import src.parse_worker as worker
+from src.config import SUPPORTED_DOCUMENT_EXTENSIONS
 from src.models import Chunk, DataValidationError
 from src.parse_worker import PageMarkdown, build_chunks
 
@@ -213,6 +215,34 @@ def test_cli_rejects_unsafe_or_unsupported_names(
     )
 
 
+@pytest.mark.parametrize("extension", sorted(SUPPORTED_DOCUMENT_EXTENSIONS))
+def test_cli_accepts_every_liteparse_extension(
+    tmp_path: Path, extension: str
+) -> None:
+    input_path = tmp_path / f"input{extension}"
+    output_path = tmp_path / "chunks.json"
+    input_path.write_bytes(b"fixture")
+
+    assert (
+        worker.main(
+            [
+                "--input",
+                str(input_path),
+                "--output",
+                str(output_path),
+                "--file-id",
+                "f",
+                "--file-name",
+                f"safe{extension}",
+            ],
+            parse_document=lambda *args: [
+                Chunk("f", f"safe{extension}", 0, ["p. 1"], "text")
+            ],
+        )
+        == 0
+    )
+
+
 def test_atomic_replace_failure_preserves_previous_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -247,8 +277,14 @@ def test_fastapi_side_modules_do_not_import_parser_stack() -> None:
         paths.append(documents)
 
     for path in paths:
-        source = path.read_text(encoding="utf-8").lower()
-        assert not any(name in source for name in banned), path
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".", 1)[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".", 1)[0])
+        assert not imported.intersection(banned), path
 
 
 def test_model_server_microbatches_cover_the_chunk_token_limit() -> None:

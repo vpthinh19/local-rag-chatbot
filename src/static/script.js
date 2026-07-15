@@ -149,7 +149,7 @@ const loadDocuments = async () => {
                 downloadBtn.dataset.fileId = doc.file_id;
                 downloadBtn.dataset.fileName = doc.file_name;
                 deleteBtn.dataset.fileId = doc.file_id;
-                docItem.querySelector('.doc-chunks').textContent = `${doc.chunk_count} chunks`;
+                docItem.querySelector('.doc-chunks').textContent = `${doc.chunk_count} đoạn`;
                 documentsList.appendChild(docItem);
             }
             
