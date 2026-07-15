@@ -54,7 +54,7 @@ The app must run with one Uvicorn worker. Multiple workers would duplicate the i
 
 File copying, JSON persistence, BM25, NumPy similarity, fusion, and HTTP orchestration remain in FastAPI. They are not separate processes.
 
-The three model servers are GPU-backed CUDA containers started and supervised outside FastAPI using the operational commands in `test.txt`. FastAPI neither spawns nor stops them; it only calls their configured HTTP endpoints.
+The three model servers are GPU-backed CUDA containers started and supervised outside FastAPI. `docker-compose.yaml` is the authoritative runtime definition; `test.txt` remains a protocol/request-shape reference from the experiments. FastAPI neither spawns nor stops the containers; it only calls their configured HTTP endpoints.
 
 ## 4. Minimal source structure
 
@@ -246,12 +246,12 @@ The high generation throughput of the QAT 4-bit model with MTP is used primarily
 
 ## 11. HTTP client
 
-FastAPI owns one long-lived `httpx.AsyncClient` with connection pooling and explicit connect, read, write, and pool timeouts. It calls the endpoints from `test.txt` directly; the OpenAI SDK is not required.
+FastAPI owns one long-lived `httpx.AsyncClient` with connection pooling and explicit connect, read, write, and pool timeouts. It calls the configured llama.cpp endpoints directly using the request shapes verified in `test.txt`; the OpenAI SDK is not required.
 
 The client validates:
 
 - non-2xx responses and useful bounded error text;
-- chat response and streaming SSE shapes;
+- chat response and streaming SSE shapes, including role-only or `content: null` boundary deltas;
 - streamed content versus tool-call deltas;
 - embedding row/dimension/finite-value invariants;
 - reranking indices and finite scores.
@@ -292,7 +292,7 @@ Development dependencies are `pytest` and `pytest-asyncio`. Do not add `docling`
 
 Configuration exposes paths; `LLM_URL`, `EMBED_URL`, and `RERANK_URL`; HTTP timeouts; embedding batch size; lexical/semantic/candidate/final limits; worker termination grace time; maximum upload/pages/context sizes; and the BGE-M3 tokenizer identifier or local tokenizer path. LiteParse parsing/chunking defaults remain a small fixed production policy rather than a public matrix of tuning knobs.
 
-Model file paths and CUDA flags belong only to the container commands, not application configuration.
+Model file paths and CUDA flags belong only to `docker-compose.yaml` service commands, not application configuration.
 
 LibreOffice is a system prerequisite for DOCX conversion, not a Python dependency. Its absence produces a clear ingestion error and never mutates committed state.
 

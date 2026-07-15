@@ -54,6 +54,8 @@ The exact number of helper functions is implementation-driven. Do not create ext
 
 - Modify `pyproject.toml`
 - Modify `uv.lock`
+- Retain and commit `.python-version`
+- Retain and commit `docker-compose.yaml`
 - Create `tests/test_ui_assets.py`
 
 ### Work
@@ -68,16 +70,19 @@ The exact number of helper functions is implementation-driven. Do not create ext
    - `tokenizers`
 2. Add a dev dependency group containing `pytest` and `pytest-asyncio`.
 3. Confirm `docling`, `torch`, `chonkie`, `llama-cpp-python`, `model2vec`, OpenAI SDK, agent frameworks, task queues, and vector databases are absent.
-4. Verify `libreoffice --headless --version` for DOCX conversion and prefetch `BAAI/bge-m3` through `Tokenizer.from_pretrained()` once during environment setup. Do not commit cache contents.
-5. Add preservation tests for the existing HTML control IDs and static assets.
-6. Add safety assertions that server/user filenames and message content are not interpolated into `innerHTML`. The current filename rendering is expected to fail until Task 8.
-7. Lock and sync the environment.
+4. Keep Python pinned to 3.12 through `.python-version`; project commands use `uv run` rather than the system `python` executable.
+5. Treat `docker-compose.yaml` as the authoritative three-model runtime definition, validate it with `docker compose config --quiet`, and keep `test.txt` only as a protocol/request-shape reference.
+6. Verify `libreoffice --headless --version` for DOCX conversion and prefetch `BAAI/bge-m3` through `Tokenizer.from_pretrained()` once during environment setup. Do not commit cache contents.
+7. Add preservation tests for the existing HTML control IDs and static assets.
+8. Add safety assertions that server/user filenames and message content are not interpolated into `innerHTML`. The current filename rendering is expected to fail until Task 8.
+9. Lock and sync the environment.
 
 ### Verification
 
 ```bash
 uv lock
 uv sync --group dev
+docker compose config --quiet
 libreoffice --headless --version
 uv run python -c "from tokenizers import Tokenizer; Tokenizer.from_pretrained('BAAI/bge-m3')"
 uv run pytest tests/test_ui_assets.py -v
@@ -178,7 +183,7 @@ Use the exact endpoint shapes demonstrated in `test.txt`. Keep URL joining expli
 ### Required behavior
 
 1. Non-2xx responses raise one bounded, user-safe model HTTP exception.
-2. SSE ignores blank/comment lines, recognizes `[DONE]`, and reports malformed JSON/choice shapes.
+2. SSE ignores blank/comment lines and role-only or `content: null` boundary deltas, recognizes `[DONE]`, and reports malformed JSON/choice shapes.
 3. Streaming tool calls accumulate fragmented IDs, function names, and argument strings by tool-call index.
 4. Embeddings parse the deployed batch shape as a list of indexed items, extract each vector from `embedding[0]`, map by item `index`, then validate row count, dimension, nonzero dimension, numeric types, and finite values.
 5. Reranking validates `results[*].index`, rejects duplicates/out-of-range indices, and maps scores by index rather than response order.
@@ -610,7 +615,7 @@ The `rg` command should return no production match except a deliberate comment/t
 
 ### Manual verification
 
-1. Start the three llama.cpp containers from the operational commands in `test.txt`.
+1. Start the three llama.cpp containers with `docker compose up -d`, then verify the request shapes recorded in `test.txt` against the live endpoints.
 2. Start FastAPI with one Uvicorn worker.
 3. Upload `docs/DACSN.docx` with acknowledgement and with a summary request; verify LibreOffice conversion, readable Markdown, and page refs.
 4. Upload the image-only `docs/test.pdf`; verify selective Vietnamese/English OCR, UI/API responsiveness, and SSE heartbeats.
