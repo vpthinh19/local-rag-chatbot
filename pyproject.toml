@@ -10,7 +10,6 @@ dependencies = [
     "httpx>=0.28.1",
     "liteparse>=2.5.1",
     "numpy>=2.5.1",
-    "openai-agents>=0.18.3",
     "semantic-text-splitter>=0.32.0",
     "tokenizers>=0.23.1",
 ]
