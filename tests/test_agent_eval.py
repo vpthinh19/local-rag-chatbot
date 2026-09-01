@@ -25,7 +25,7 @@ from src.sessions import SessionService
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "agent_cases.json"
-RUN_LIVE = os.getenv("RUN_LIVE_MODEL_TEST") == "1"
+RUN_LIVE = os.getenv("RUN_LIVE_MODEL_TESTS") == "1"
 
 
 def _cases() -> list[dict[str, object]]:
@@ -163,7 +163,7 @@ def _tool_call(items: list[object]) -> tuple[str, dict[str, object]] | None:
 
 
 @pytest.mark.live_model
-@pytest.mark.skipif(not RUN_LIVE, reason="set RUN_LIVE_MODEL_TEST=1")
+@pytest.mark.skipif(not RUN_LIVE, reason="set RUN_LIVE_MODEL_TESTS=1")
 @pytest.mark.asyncio
 async def test_live_sdk_agent_decisions_and_grounded_final_answers() -> None:
     choice_total = choice_correct = 0
@@ -251,7 +251,7 @@ async def test_live_sdk_agent_decisions_and_grounded_final_answers() -> None:
 
 
 @pytest.mark.live_model
-@pytest.mark.skipif(not RUN_LIVE, reason="set RUN_LIVE_MODEL_TEST=1")
+@pytest.mark.skipif(not RUN_LIVE, reason="set RUN_LIVE_MODEL_TESTS=1")
 @pytest.mark.asyncio
 async def test_live_reranker_score_direction() -> None:
     settings = Settings()

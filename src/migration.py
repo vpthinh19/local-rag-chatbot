@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import inspect
 import json
 import mimetypes
@@ -19,7 +20,6 @@ from src.database import Database
 from src.models import (
     Chunk,
     DataValidationError,
-    Document,
     Message,
     MigrationReport,
 )
@@ -32,6 +32,56 @@ _EMBEDDING_SIGNATURE = "embedding_signature"
 _LEGACY_SESSION_ID = "legacy-default"
 _SAFE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 _MAX_ERROR_CHARS = 500
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyDocument:
+    """The old corpus record, decoded only while importing its backup JSON."""
+
+    file_id: str
+    file_name: str
+    overview: str
+    chunk_count: int
+
+
+def _legacy_string(value: object, label: str, *, allow_empty: bool = False) -> str:
+    if not isinstance(value, str) or (not allow_empty and not value.strip()):
+        suffix = "a string" if allow_empty else "a nonempty string"
+        raise DataValidationError(f"{label} must be {suffix}")
+    return value
+
+
+def _legacy_integer(value: object, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise DataValidationError(f"{label} must be a nonnegative integer")
+    return value
+
+
+def _decode_legacy_document(value: object) -> _LegacyDocument:
+    if not isinstance(value, dict):
+        raise DataValidationError("document must be a JSON object")
+    try:
+        return _LegacyDocument(
+            _legacy_string(value["file_id"], "document.file_id"),
+            _legacy_string(value["file_name"], "document.file_name"),
+            _legacy_string(value.get("overview", value.get("summary", "")), "document.overview", allow_empty=True),
+            _legacy_integer(value["chunk_count"], "document.chunk_count"),
+        )
+    except KeyError as exc:
+        raise DataValidationError(f"document is missing {exc.args[0]}") from exc
+
+
+def _decode_legacy_message(value: object) -> Message:
+    if not isinstance(value, dict):
+        raise DataValidationError("message must be a JSON object")
+    try:
+        role = _legacy_string(value["role"], "message.role")
+        content = _legacy_string(value["content"], "message.content")
+    except KeyError as exc:
+        raise DataValidationError(f"message is missing {exc.args[0]}") from exc
+    if role not in {"user", "assistant"}:
+        raise DataValidationError("message.role must be user or assistant")
+    return Message(role, content)
 
 
 class _Session(Protocol):
@@ -178,7 +228,7 @@ async def _import_corpus(
     known_document_ids: set[str] = set()
     for index, value in enumerate(raw_documents):
         try:
-            document = Document.from_dict(value)
+            document = _decode_legacy_document(value)
             if not _SAFE_ID.fullmatch(document.file_id):
                 raise DataValidationError("document.file_id is unsafe")
         except DataValidationError as exc:
@@ -211,7 +261,7 @@ async def _import_corpus(
 
 
 async def _copy_legacy_source(
-    settings: Settings, document: Document, errors: list[str]
+    settings: Settings, document: _LegacyDocument, errors: list[str]
 ) -> bool | None:
     destination = settings.uploads_dir / document.file_id
     if destination.is_file():
@@ -247,7 +297,7 @@ def _copy_source_atomically(source: Path, temporary: Path, destination: Path) ->
 
 async def _insert_document(
     database: Database,
-    document: Document,
+    document: _LegacyDocument,
     chunks: list[Chunk],
     source_available: bool,
 ) -> bool:
@@ -318,7 +368,7 @@ async def _import_history(
             errors.append(_error(f"legacy message {index}: unsupported role"))
             continue
         try:
-            messages.append(Message.from_dict(value))
+            messages.append(_decode_legacy_message(value))
         except DataValidationError as exc:
             errors.append(_error(f"legacy message {index}: {exc}"))
     if not messages:

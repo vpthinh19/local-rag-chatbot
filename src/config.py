@@ -158,23 +158,13 @@ class Settings:
 
     @property
     def legacy_corpus_path(self) -> Path:
-        """Return the temporary JSON corpus path used by migration."""
+        """Return the read-only legacy corpus backup used by migration."""
         return self.data_dir / "corpus" / "corpus.json"
 
     @property
     def legacy_history_path(self) -> Path:
-        """Return the temporary JSON history path used by migration."""
+        """Return the read-only legacy history backup used by migration."""
         return self.data_dir / "history" / "chat_history.json"
-
-    @property
-    def corpus_path(self) -> Path:
-        """Return the compatibility alias for the legacy corpus manifest."""
-        return self.legacy_corpus_path
-
-    @property
-    def history_path(self) -> Path:
-        """Return the compatibility alias for the legacy chat history."""
-        return self.legacy_history_path
 
     def ensure_dirs(self) -> None:
         """Create every application-owned data directory."""

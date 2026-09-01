@@ -269,7 +269,6 @@ def test_fastapi_side_modules_do_not_import_parser_stack() -> None:
         Path("src/main.py"),
         Path("src/config.py"),
         Path("src/models.py"),
-        Path("src/llama.py"),
         Path("src/rag.py"),
     ]
     documents = Path("src/documents.py")
