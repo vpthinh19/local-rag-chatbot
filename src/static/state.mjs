@@ -11,6 +11,8 @@ export const reduceStreamEvent = ({ buffers, sessionId, event }) => {
   const next = { ...current };
   if (event.type === "delta") next.text += event.text || "";
   if (event.type === "status") next.status = event.text || "";
-  if (event.type === "error") next.status = "Lỗi";
+  if (event.type === "error") { next.status = "Lỗi"; next.terminal = "error"; }
+  if (event.type === "cancelled") { next.status = "Đã dừng."; next.terminal = "cancelled"; }
+  if (event.type === "done") next.terminal = "done";
   return { ...buffers, [sessionId]: next };
 };

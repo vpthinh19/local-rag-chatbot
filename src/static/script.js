@@ -14,6 +14,7 @@ const sidebar = $("#sidebar");
 let selectedSessionId = null;
 const streamControllers = new Map();
 let streamBuffers = {};
+const persistedMessages = new Map();
 let documentPollTimer = null;
 
 const api = async (url, options) => {
@@ -32,8 +33,8 @@ const message = (role, content, extra = "") => {
   return row;
 };
 
-function renderMessages(messages = []) {
-  chatsContainer.replaceChildren(...messages.map(({ role, content }) => message(role, content)));
+function renderMessages(messages = persistedMessages.get(selectedSessionId) || []) {
+  chatsContainer.replaceChildren(...messages.map(({ role, content }) => message(role === "assistant" ? "bot" : role, content)));
   const buffer = streamBuffers[selectedSessionId];
   if (buffer) {
     if (buffer.user) chatsContainer.append(message("user", buffer.user));
@@ -47,7 +48,8 @@ function renderMessages(messages = []) {
 async function loadMessages(sessionId = selectedSessionId) {
   if (!sessionId) return;
   const data = await api(`/api/sessions/${sessionId}/messages`);
-  if (sessionId === selectedSessionId) renderMessages(data.messages);
+  persistedMessages.set(sessionId, data.messages);
+  if (sessionId === selectedSessionId) renderMessages();
 }
 
 async function loadSessions() {
@@ -110,7 +112,7 @@ function stopDocumentPolling() {
   documentPollTimer = null;
 }
 
-function renderStream(sessionId) { if (sessionId === selectedSessionId) loadMessages(sessionId); }
+function renderStream(sessionId) { if (sessionId === selectedSessionId) renderMessages(); }
 
 async function streamChat(sessionId, userMessage) {
   const controller = new AbortController(); streamControllers.set(sessionId, controller);
@@ -130,9 +132,12 @@ async function streamChat(sessionId, userMessage) {
       }
     }
   } catch (error) {
-    if (error.name !== "AbortError") { streamBuffers = reduceStreamEvent({ buffers: streamBuffers, sessionId, event: { type: "error" } }); renderStream(sessionId); }
+    if (error.name !== "AbortError") { streamBuffers = reduceStreamEvent({ buffers: streamBuffers, sessionId, event: { type: "error" } }); streamBuffers[sessionId].text = "Lỗi khi trả lời."; renderStream(sessionId); }
   } finally {
-    streamControllers.delete(sessionId); delete streamBuffers[sessionId]; await loadMessages(sessionId).catch(() => {});
+    streamControllers.delete(sessionId);
+    if (streamBuffers[sessionId]?.terminal === "done") {
+      delete streamBuffers[sessionId]; await loadMessages(sessionId).catch(() => {});
+    }
   }
 }
 
@@ -150,6 +155,9 @@ documentUploadForm.addEventListener("submit", async (event) => {
 });
 stopResponseBtn.addEventListener("click", async () => {
   if (!selectedSessionId) return;
+  if (streamBuffers[selectedSessionId]) {
+    streamBuffers = reduceStreamEvent({ buffers: streamBuffers, sessionId: selectedSessionId, event: { type: "cancelled" } }); renderStream(selectedSessionId);
+  }
   streamControllers.get(selectedSessionId)?.abort();
   await api(`/api/sessions/${selectedSessionId}/stop`, { method: "POST" }).catch(() => {});
 });

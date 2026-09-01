@@ -109,6 +109,23 @@ def test_stream_reducer_routes_deltas_to_its_own_session_buffer() -> None:
     assert result == {"one": {"text": "A", "status": ""}, "two": {"text": "B!", "status": ""}}
 
 
+def test_short_delta_error_stream_keeps_a_terminal_buffer() -> None:
+    program = (
+        f"import {{ reduceStreamEvent }} from {json.dumps(STATE.as_uri())};"
+        "let buffers = {one: {text: '', status: '', user: 'question'}};"
+        "buffers = reduceStreamEvent({buffers, sessionId: 'one', event: {type: 'delta', text: 'answer'}});"
+        "buffers = reduceStreamEvent({buffers, sessionId: 'one', event: {type: 'error'}});"
+        "console.log(JSON.stringify(buffers.one));"
+    )
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", program],
+        check=True, capture_output=True, text=True,
+    )
+    assert json.loads(result.stdout) == {
+        "text": "answer", "status": "Lỗi", "user": "question", "terminal": "error",
+    }
+
+
 def test_script_uses_session_routes_and_independent_upload() -> None:
     script = SCRIPT.read_text(encoding="utf-8")
     for text in ("selectedSessionId", "streamControllers", "documentPollTimer", "/api/sessions", "/messages", "/chat", "/stop"):
@@ -116,3 +133,5 @@ def test_script_uses_session_routes_and_independent_upload() -> None:
     assert "new FormData(documentUploadForm)" in script
     assert "new FormData(promptForm)" not in script
     assert "setInterval(loadDocuments, 1500)" in script
+    assert "function renderStream(sessionId) { if (sessionId === selectedSessionId) renderMessages(); }" in script
+    assert 'message(role === "assistant" ? "bot" : role, content)' in script
