@@ -67,6 +67,7 @@ async function loadSessions() {
 
 async function selectSession(sessionId) {
   selectedSessionId = sessionId;
+  syncResponseState();
   await Promise.all([loadSessions(), loadMessages(sessionId)]);
 }
 
@@ -113,9 +114,10 @@ function stopDocumentPolling() {
 }
 
 function renderStream(sessionId) { if (sessionId === selectedSessionId) renderMessages(); }
+function syncResponseState() { document.body.classList.toggle("bot-responding", streamControllers.has(selectedSessionId)); }
 
 async function streamChat(sessionId, userMessage) {
-  const controller = new AbortController(); streamControllers.set(sessionId, controller);
+  const controller = new AbortController(); streamControllers.set(sessionId, controller); syncResponseState();
   streamBuffers = { ...streamBuffers, [sessionId]: { text: "", status: "Đang xử lý...", user: userMessage } }; renderStream(sessionId);
   try {
     const response = await fetch(`/api/sessions/${sessionId}/chat`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ message: userMessage }), signal: controller.signal });
@@ -135,6 +137,7 @@ async function streamChat(sessionId, userMessage) {
     if (error.name !== "AbortError") { streamBuffers = reduceStreamEvent({ buffers: streamBuffers, sessionId, event: { type: "error" } }); streamBuffers[sessionId].text = "Lỗi khi trả lời."; renderStream(sessionId); }
   } finally {
     streamControllers.delete(sessionId);
+    syncResponseState();
     if (streamBuffers[sessionId]?.terminal === "done") {
       delete streamBuffers[sessionId]; await loadMessages(sessionId).catch(() => {});
     }

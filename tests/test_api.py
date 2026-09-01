@@ -90,6 +90,27 @@ async def test_chat_sse_uses_named_application_events_and_heartbeat(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_first_chat_message_titles_only_untitled_sessions(tmp_path: Path) -> None:
+    async with _client(tmp_path) as (app, client):
+        async def stream(session: str, message: str):
+            del session, message
+            yield AgentEvent("start")
+            yield AgentEvent("done")
+
+        app.state.runtime.agent.stream = stream
+        first = (await client.post("/api/sessions")).json()["id"]
+        message = "x" * 100
+        assert (await client.post(f"/api/sessions/{first}/chat", json={"message": message})).status_code == 200
+        assert (await client.get("/api/sessions")).json()["sessions"][0]["title"] == "x" * 80
+
+        renamed = (await client.post("/api/sessions")).json()["id"]
+        await client.patch(f"/api/sessions/{renamed}", json={"title": "Manual title"})
+        assert (await client.post(f"/api/sessions/{renamed}/chat", json={"message": "new first"})).status_code == 200
+        sessions = {item["id"]: item["title"] for item in (await client.get("/api/sessions")).json()["sessions"]}
+        assert sessions[renamed] == "Manual title"
+
+
+@pytest.mark.asyncio
 async def test_chat_validation_is_json_4xx_before_stream_and_stream_errors_are_events(tmp_path: Path) -> None:
     async with _client(tmp_path) as (app, client):
         session_id = (await client.post("/api/sessions")).json()["id"]

@@ -83,11 +83,12 @@ class ParserService:
                             f"document parser exited with code {return_code}"
                             + (f": {detail}" if detail else "")
                         )
-                    chunks = self._load_worker_chunks(
-                        output_path, document_id, file_name
+                    return await asyncio.to_thread(
+                        self._load_and_validate_worker_chunks,
+                        output_path,
+                        document_id,
+                        file_name,
                     )
-                    validate_parsed_chunks(chunks)
-                    return chunks
                 except asyncio.CancelledError:
                     await self._stop_worker_group(process)
                     raise
@@ -195,6 +196,14 @@ class ParserService:
             raise DataValidationError("parser chunk metadata does not match upload")
         if [chunk.chunk_id for chunk in chunks] != list(range(len(chunks))):
             raise DataValidationError("parser chunk IDs are not sequential")
+        return chunks
+
+    @classmethod
+    def _load_and_validate_worker_chunks(
+        cls, path: Path, document_id: str, file_name: str
+    ) -> list[Chunk]:
+        chunks = cls._load_worker_chunks(path, document_id, file_name)
+        validate_parsed_chunks(chunks)
         return chunks
 
     @staticmethod

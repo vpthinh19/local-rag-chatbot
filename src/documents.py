@@ -20,6 +20,7 @@ from src.parser import ParserService
 
 
 _SAFE_CHAR = re.compile(r"[^\w .()-]+", re.UNICODE)
+_DURABLE_SOURCE_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
 _MEDIA_TYPES: dict[str, frozenset[str]] = {
     ".pdf": frozenset({"application/pdf"}),
@@ -55,10 +56,11 @@ _MEDIA_TYPES: dict[str, frozenset[str]] = {
 class DocumentService:
     """Accept files independently from chat and queue only durable work."""
 
-    def __init__(self, settings: Settings, database: Database) -> None:
+    def __init__(self, settings: Settings, database: Database, publication_lock: Any | None = None) -> None:
         self._settings = settings
         self._database = database
         self._parser = ParserService(settings)
+        self._publication_lock = publication_lock or asyncio.Lock()
         self._waker: Callable[[], None] | None = None
 
     async def create_upload(self, upload: Any) -> DocumentRecord:
@@ -106,23 +108,25 @@ class DocumentService:
             staged_path.unlink(missing_ok=True)
 
     async def list(self) -> list[DocumentRecord]:
-        return await self._database.read(
-            lambda conn: [
-                self._record(row)
-                for row in conn.execute(
-                    "SELECT id, file_name, media_type, status, overview, chunk_count, error, created_at, updated_at "
-                    "FROM documents ORDER BY created_at DESC, id DESC"
-                )
-            ]
-        )
+        async with self._publication_lock:
+            return await self._database.read(
+                lambda conn: [
+                    self._record(row)
+                    for row in conn.execute(
+                        "SELECT id, file_name, media_type, status, overview, chunk_count, error, created_at, updated_at "
+                        "FROM documents ORDER BY created_at DESC, id DESC"
+                    )
+                ]
+            )
 
     async def get(self, document_id: str) -> DocumentRecord | None:
-        row = await self._database.read(
-            lambda conn: conn.execute(
-                "SELECT id, file_name, media_type, status, overview, chunk_count, error, created_at, updated_at "
-                "FROM documents WHERE id = ?", (document_id,)
-            ).fetchone()
-        )
+        async with self._publication_lock:
+            row = await self._database.read(
+                lambda conn: conn.execute(
+                    "SELECT id, file_name, media_type, status, overview, chunk_count, error, created_at, updated_at "
+                    "FROM documents WHERE id = ?", (document_id,)
+                ).fetchone()
+            )
         return None if row is None else self._record(row)
 
     async def retry(self, document_id: str) -> DocumentRecord:
@@ -212,7 +216,7 @@ class DocumentService:
                 path.unlink(missing_ok=True)
         referenced = set(await self._database.read(lambda conn: [str(row[0]) for row in conn.execute("SELECT id FROM documents")]))
         for path in self._settings.uploads_dir.iterdir():
-            if path.is_file() and path.name not in referenced:
+            if path.is_file() and _DURABLE_SOURCE_ID.fullmatch(path.name) and path.name not in referenced:
                 path.unlink(missing_ok=True)
 
     def source_path(self, document_id: str) -> Path:
@@ -253,7 +257,7 @@ class DocumentService:
                     total += len(value)
                     if total > self._settings.max_upload_bytes:
                         raise DataValidationError("upload exceeds the size limit")
-                    handle.write(value)
+                    await asyncio.to_thread(self._write_block, handle, value)
             if not total:
                 raise DataValidationError("upload is empty")
             return path
@@ -264,6 +268,10 @@ class DocumentService:
     def _wake_worker(self) -> None:
         if self._waker is not None:
             self._waker()
+
+    @staticmethod
+    def _write_block(handle: Any, value: bytes) -> None:
+        handle.write(value)
 
     @staticmethod
     def _record(row: Any) -> DocumentRecord:

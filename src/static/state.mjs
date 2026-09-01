@@ -1,7 +1,7 @@
 export const shouldPollDocuments = (documents) => documents.some(({ status }) => status === "processing" || status === "deleting");
 
 export const documentActions = ({ status }) => {
-  if (status === "failed") return ["retry", "delete"];
+  if (status === "failed") return ["download", "retry", "delete"];
   if (status === "deleting") return [];
   return ["download", "delete"];
 };

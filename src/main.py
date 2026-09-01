@@ -122,7 +122,7 @@ def create_app(
             snapshots = SnapshotStore(
                 IndexSnapshot((), (), np.empty((0, 0), dtype=np.float32), None)
             )
-            documents = DocumentService(configured, database)
+            documents = DocumentService(configured, database, snapshots.publication_lock)
             await documents.reconcile_files()
             worker = DocumentWorker(
                 configured, database, documents, documents.parser, models, rag, snapshots
@@ -210,6 +210,7 @@ def create_app(
             if "already active" in str(exc):
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        await runtime.sessions.touch_from_first_message(session_id, message)
 
         async def events() -> AsyncIterator[str]:
             pending: asyncio.Task[AgentEvent] | None = None

@@ -4,6 +4,7 @@ import asyncio
 import json
 from pathlib import Path
 import sys
+import threading
 
 import pytest
 
@@ -102,6 +103,40 @@ async def test_parser_stages_committed_source_under_its_validated_suffix(
 
     assert [chunk.text for chunk in chunks] == ["Nội dung từ fake worker."]
     assert list(settings.staging_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_parser_decodes_and_validates_worker_output_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(data_dir=tmp_path / "data")
+    settings.ensure_dirs()
+    source = settings.uploads_dir / "document-id"
+    source.write_bytes(b"source")
+    parser = ParserService(settings)
+    threads: list[int] = []
+    original = ParserService._load_worker_chunks
+
+    def record(*args: object) -> list[Chunk]:
+        threads.append(threading.get_ident())
+        return original(*args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ParserService, "_load_worker_chunks", staticmethod(record))
+    async def spawn_fake(command: list[str]) -> asyncio.subprocess.Process:
+        return await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(FAKE_WORKER),
+            *command[3:],
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+
+    parser._spawn_worker = spawn_fake  # type: ignore[method-assign]
+    monkeypatch.setenv("FAKE_PARSE_MODE", "success")
+    event_loop_thread = threading.get_ident()
+    await parser.parse("document-id", "report.pdf", source)
+    assert threads and threads != [event_loop_thread]
 
 
 @pytest.mark.asyncio

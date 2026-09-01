@@ -96,7 +96,7 @@ def test_document_polling_only_runs_for_nonterminal_states() -> None:
 
 def test_document_actions_follow_document_status() -> None:
     assert run_state_function("documentActions", {"status": "ready"}) == ["download", "delete"]
-    assert run_state_function("documentActions", {"status": "failed"}) == ["retry", "delete"]
+    assert run_state_function("documentActions", {"status": "failed"}) == ["download", "retry", "delete"]
     assert run_state_function("documentActions", {"status": "processing"}) == ["download", "delete"]
     assert run_state_function("documentActions", {"status": "deleting"}) == []
 
@@ -135,3 +135,5 @@ def test_script_uses_session_routes_and_independent_upload() -> None:
     assert "setInterval(loadDocuments, 1500)" in script
     assert "function renderStream(sessionId) { if (sessionId === selectedSessionId) renderMessages(); }" in script
     assert 'message(role === "assistant" ? "bot" : role, content)' in script
+    assert "function syncResponseState()" in script
+    assert "document.body.classList.toggle(\"bot-responding\", streamControllers.has(selectedSessionId))" in script

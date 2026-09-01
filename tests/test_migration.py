@@ -13,6 +13,7 @@ import pytest_asyncio
 import src.migration as migration_module
 from src.config import Settings
 from src.database import Database
+from src.documents import DocumentService
 from src.migration import migrate_legacy
 
 
@@ -166,6 +167,38 @@ async def test_legacy_migration_is_idempotent(migration_harness: MigrationHarnes
     assert migration_harness.corpus_json.read_bytes() == corpus_before
     assert migration_harness.history_json.read_bytes() == history_before
     assert (migration_harness.settings.uploads_dir / "doc-one").read_bytes() == b"legacy source"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_keeps_legacy_originals_after_valid_and_malformed_imports(
+    migration_harness: MigrationHarness,
+) -> None:
+    migration_harness.write_corpus_one_document()
+    malformed = migration_harness.settings.uploads_dir / "broken_broken.pdf"
+    malformed.write_bytes(b"malformed legacy source")
+    migration_harness._write_corpus(
+        [
+            {
+                "file_id": "doc-one",
+                "file_name": "rules.pdf",
+                "overview": "Quy định cũ",
+                "chunk_count": 2,
+            },
+            {"file_id": "broken", "file_name": "broken.pdf", "chunk_count": "bad"},
+        ],
+        [
+            {"file_id": "doc-one", "file_name": "rules.pdf", "chunk_id": 0, "refs": ["p. 1"], "text": "Nội dung thứ nhất"},
+            {"file_id": "doc-one", "file_name": "rules.pdf", "chunk_id": 1, "refs": ["p. 2"], "text": "Nội dung thứ hai"},
+        ],
+    )
+    original = migration_harness.settings.uploads_dir / "doc-one_rules.pdf"
+    before = {path: path.read_bytes() for path in (original, malformed)}
+
+    await migration_harness.run()
+    await DocumentService(migration_harness.settings, migration_harness.database).reconcile_files()
+
+    assert await migration_harness.count("documents") == 1
+    assert {path: path.read_bytes() for path in before} == before
 
 
 @pytest.mark.asyncio
