@@ -104,7 +104,11 @@ _session_input_callback_type: SessionInputCallback = bounded_session_input  # ty
 
 
 class TransactionalSession:
-    """Overlay SDK writes so only a completed agent turn becomes durable."""
+    """Overlay SDK writes so only a completed addition-only turn becomes durable.
+
+    Public Session methods cannot atomically combine rewinding pre-existing history
+    with appending new items. Such a mixed overlay therefore fails closed at commit.
+    """
 
     def __init__(self, delegate: _Session) -> None:
         self._delegate = delegate
@@ -144,11 +148,11 @@ class TransactionalSession:
         await self._delegate.clear_session()
 
     async def commit(self) -> None:
-        """Replay deferred rewinds, then persist all buffered additions in one write."""
-        while self._durable_pop_count:
-            if await self._delegate.pop_item() is None:
-                raise RuntimeError("durable session changed before transaction commit")
-            self._durable_pop_count -= 1
+        """Persist one buffered addition batch, never an unatomic durable rewind."""
+        if self._durable_pop_count:
+            raise RuntimeError(
+                "cannot atomically commit durable rewinds with public Session APIs"
+            )
         if self._pending_items:
             await self._delegate.add_items(deepcopy(self._pending_items))
             self._pending_items.clear()

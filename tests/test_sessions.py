@@ -44,6 +44,7 @@ class MemorySession:
     def __init__(self, items: list[dict[str, object]] = []) -> None:
         self.items = deepcopy(items)
         self.add_calls: list[list[dict[str, object]]] = []
+        self.pop_calls = 0
 
     async def get_items(self, limit: int | None = None) -> list[dict[str, object]]:
         items = deepcopy(self.items)
@@ -55,6 +56,7 @@ class MemorySession:
         self.items.extend(copied)
 
     async def pop_item(self) -> dict[str, object] | None:
+        self.pop_calls += 1
         return self.items.pop() if self.items else None
 
     async def clear_session(self) -> None:
@@ -139,17 +141,57 @@ async def test_transactional_pop_of_existing_history_is_rolled_back_by_discard()
 
 
 @pytest.mark.asyncio
-async def test_transactional_commit_replays_pops_then_adds_once() -> None:
-    """Would fail if commit retained rewound history or split new writes across calls."""
+async def test_transactional_commit_rejects_mixed_durable_rewind_without_writing() -> None:
+    """Would fail if an unatomic mixed commit could delete prior durable history."""
     durable = MemorySession([user("old"), assistant("old answer")])
     session = TransactionalSession(durable)
     await session.pop_item()
     await session.add_items([assistant("replacement")])
 
+    with pytest.raises(RuntimeError, match="cannot atomically commit durable rewinds"):
+        await session.commit()
+
+    assert await durable.get_items() == [user("old"), assistant("old answer")]
+    assert durable.pop_calls == 0
+    assert durable.add_calls == []
+
+
+@pytest.mark.asyncio
+async def test_transactional_commit_add_failure_leaves_prior_history_unchanged() -> None:
+    """Would fail if a failed one-call append could alter pre-existing session history."""
+
+    class FailingAddSession(MemorySession):
+        async def add_items(self, items: list[dict[str, object]]) -> None:
+            del items
+            raise OSError("storage unavailable")
+
+    original = [user("old"), assistant("old answer")]
+    durable = FailingAddSession(original)
+    session = TransactionalSession(durable)
+    await session.add_items([user("new question")])
+
+    with pytest.raises(OSError, match="storage unavailable"):
+        await session.commit()
+    await session.discard()
+
+    assert await durable.get_items() == original
+
+
+@pytest.mark.asyncio
+async def test_transactional_retry_pop_removes_only_pending_input() -> None:
+    """Would fail if the SDK retry path rewound durable history instead of its pending input."""
+    durable = MemorySession([user("old"), assistant("old answer")])
+    session = TransactionalSession(durable)
+    retry_input = user("retry question")
+    await session.add_items([retry_input])
+
+    assert await session.pop_item() == retry_input
+    await session.add_items([retry_input])
     await session.commit()
 
-    assert await durable.get_items() == [user("old"), assistant("replacement")]
-    assert durable.add_calls == [[assistant("replacement")]]
+    assert await durable.get_items() == [user("old"), assistant("old answer"), retry_input]
+    assert durable.pop_calls == 0
+    assert durable.add_calls == [[retry_input]]
 
 
 @pytest.mark.asyncio
