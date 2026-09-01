@@ -4,14 +4,18 @@ BM25S uses a lowercase word-regex tokenizer here. It handles Vietnamese
 diacritics, but it does not perform Vietnamese compound-word segmentation.
 """
 
+import asyncio
+from collections.abc import Sequence
+from concurrent.futures import Executor
 from dataclasses import dataclass
 import math
+from typing import Protocol
 
 import bm25s
 import numpy as np
 
 from src.llama import LlamaClient
-from src.models import Chunk, Corpus
+from src.models import Chunk, Corpus, DocumentRecord, StoredChunk
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,3 +307,343 @@ class RagIndex:
     def _tokenize_one(cls, text: str) -> list[str]:
         """Tokenize one query with the document tokenizer."""
         return cls._tokenize_many([text])[0]
+
+
+class _ModelClients(Protocol):
+    """The narrow retrieval-facing model boundary."""
+
+    async def embed(self, texts: list[str]) -> list[list[float]]: ...
+
+    async def rerank(self, query: str, documents: list[str]) -> list[float]: ...
+
+
+class _PublicationLock:
+    """An async lock that can prove its current task owns publication."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: asyncio.Task[object] | None = None
+
+    async def __aenter__(self) -> "_PublicationLock":
+        await self._lock.acquire()
+        task = asyncio.current_task()
+        if task is None:  # pragma: no cover - asyncio always supplies a task here
+            self._lock.release()
+            raise RuntimeError("publication lock requires an asyncio task")
+        self._owner = task
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        self._owner = None
+        self._lock.release()
+
+    def held_by_current_task(self) -> bool:
+        return self._owner is asyncio.current_task()
+
+    def locked(self) -> bool:
+        """Expose the standard lock diagnostic used by operational callers."""
+        return self._lock.locked()
+
+
+@dataclass(frozen=True, slots=True)
+class IndexSnapshot:
+    """An immutable, fully aligned retrieval view of ready durable records."""
+
+    documents: tuple[DocumentRecord, ...]
+    chunks: tuple[StoredChunk, ...]
+    vectors: np.ndarray
+    lexical: bm25s.BM25 | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.documents, tuple) or not all(
+            isinstance(document, DocumentRecord) for document in self.documents
+        ):
+            raise TypeError("snapshot documents must be a tuple of DocumentRecord values")
+        if not isinstance(self.chunks, tuple) or not all(
+            isinstance(chunk, StoredChunk) for chunk in self.chunks
+        ):
+            raise TypeError("snapshot chunks must be a tuple of StoredChunk values")
+        vectors = np.asarray(self.vectors, dtype=np.float32)
+        if vectors.ndim != 2 or vectors.shape[0] != len(self.chunks):
+            raise ValueError("snapshot vectors must align with chunks")
+        if self.chunks and vectors.shape[1] == 0:
+            raise ValueError("snapshot vectors must have a dimension")
+        if not np.isfinite(vectors).all():
+            raise ValueError("snapshot vectors must be finite")
+        if vectors.shape[0] and np.any(np.linalg.norm(vectors, axis=1) == 0):
+            raise ValueError("snapshot vectors must not contain zero rows")
+        detached = np.array(vectors, dtype=np.float32, copy=True, order="C")
+        detached.setflags(write=False)
+        object.__setattr__(self, "vectors", detached)
+
+    @property
+    def document_ids(self) -> frozenset[str]:
+        """Return the ready document identifiers represented by this snapshot."""
+        return frozenset(document.id for document in self.documents)
+
+
+class SnapshotStore:
+    """Publish complete snapshots only after the matching durable commit."""
+
+    def __init__(self, initial: IndexSnapshot) -> None:
+        if not isinstance(initial, IndexSnapshot):
+            raise TypeError("initial snapshot must be an IndexSnapshot")
+        self._current = initial
+        self.publication_lock = _PublicationLock()
+
+    async def capture(self) -> IndexSnapshot:
+        """Capture one snapshot reference outside the database/install interval."""
+        async with self.publication_lock:
+            return self._current
+
+    def install_locked(self, candidate: IndexSnapshot) -> None:
+        """Install a prepared candidate while this task owns the publication gate."""
+        if not isinstance(candidate, IndexSnapshot):
+            raise TypeError("candidate snapshot must be an IndexSnapshot")
+        if not self.publication_lock.held_by_current_task():
+            raise RuntimeError("install_locked requires the publication lock")
+        self._current = candidate
+
+
+class RagService:
+    """Build persisted-vector snapshots and retrieve against explicit snapshots."""
+
+    def __init__(
+        self,
+        models: _ModelClients,
+        *,
+        cpu_executor: Executor,
+        batch_size: int | None = None,
+        lexical_limit: int | None = None,
+        semantic_limit: int | None = None,
+        candidate_limit: int | None = None,
+        final_limit: int | None = None,
+        embedding_batch_size: int | None = None,
+        lexical_candidate_limit: int | None = None,
+        semantic_candidate_limit: int | None = None,
+        fused_candidate_limit: int | None = None,
+        final_chunk_limit: int | None = None,
+    ) -> None:
+        """Configure bounded CPU and model-facing retrieval stages."""
+        self._models = models
+        self._cpu_executor = cpu_executor
+        self._batch_size = self._pick_limit(
+            "batch_size", batch_size, embedding_batch_size
+        )
+        self._lexical_limit = self._pick_limit(
+            "lexical_limit", lexical_limit, lexical_candidate_limit
+        )
+        self._semantic_limit = self._pick_limit(
+            "semantic_limit", semantic_limit, semantic_candidate_limit
+        )
+        self._candidate_limit = min(
+            self._pick_limit("candidate_limit", candidate_limit, fused_candidate_limit), 16
+        )
+        self._final_limit = min(
+            self._pick_limit("final_limit", final_limit, final_chunk_limit), 6
+        )
+
+    async def build(
+        self,
+        documents: Sequence[DocumentRecord],
+        chunks: Sequence[StoredChunk],
+        vectors: np.ndarray,
+    ) -> IndexSnapshot:
+        """Construct a snapshot from persisted vectors without embedding any text."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._cpu_executor,
+            self._build_snapshot,
+            tuple(documents),
+            tuple(chunks),
+            vectors,
+        )
+
+    async def search(
+        self,
+        snapshot: IndexSnapshot,
+        queries: list[str],
+        document_ids: list[str],
+        limit: int,
+    ) -> list[StoredChunk]:
+        """Retrieve using one already-captured snapshot for the full request."""
+        if not isinstance(snapshot, IndexSnapshot):
+            raise TypeError("search requires an IndexSnapshot")
+        clean_queries = [query.strip() for query in queries if query.strip()]
+        if not snapshot.chunks or not clean_queries or limit <= 0:
+            return []
+
+        selected = set(document_ids)
+        allowed = np.asarray(
+            [
+                index
+                for index, chunk in enumerate(snapshot.chunks)
+                if not selected or chunk.document_id in selected
+            ],
+            dtype=np.intp,
+        )
+        if allowed.size == 0:
+            return []
+
+        query_vectors = await self._embed_batched(clean_queries)
+        if query_vectors.shape[1] != snapshot.vectors.shape[1]:
+            raise ValueError("query embedding dimension does not match RAG index")
+
+        best_scores: dict[int, float] = {}
+        loop = asyncio.get_running_loop()
+        for query, vector in zip(clean_queries, query_vectors, strict=True):
+            candidates = await loop.run_in_executor(
+                self._cpu_executor,
+                self._rank_candidates,
+                snapshot,
+                query,
+                vector,
+                allowed,
+            )
+            if not candidates:
+                continue
+            scores = await self._models.rerank(
+                query, [snapshot.chunks[index].text for index in candidates]
+            )
+            if len(scores) != len(candidates):
+                raise ValueError("reranker returned the wrong score count")
+            for index, score in zip(candidates, scores, strict=True):
+                if isinstance(score, bool) or not isinstance(score, (int, float)):
+                    raise ValueError("reranker returned a nonnumeric score")
+                numeric = float(score)
+                if not math.isfinite(numeric):
+                    raise ValueError("reranker returned a nonfinite score")
+                best_scores[index] = max(best_scores.get(index, -math.inf), numeric)
+
+        result_limit = min(limit, self._final_limit, 6)
+        ranked = sorted(best_scores, key=lambda index: (-best_scores[index], index))
+        return [snapshot.chunks[index] for index in ranked[:result_limit]]
+
+    async def _embed_batched(self, texts: list[str]) -> np.ndarray:
+        rows: list[list[float]] = []
+        dimension: int | None = None
+        for start in range(0, len(texts), self._batch_size):
+            values = await self._models.embed(texts[start : start + self._batch_size])
+            matrix = self._normalize_rows(
+                values,
+                expected_rows=min(self._batch_size, len(texts) - start),
+                label="query embedding",
+            )
+            if dimension is None:
+                dimension = matrix.shape[1]
+            elif matrix.shape[1] != dimension:
+                raise ValueError("embedding dimension changed between batches")
+            rows.extend(matrix.tolist())
+        return np.asarray(rows, dtype=np.float32)
+
+    def _rank_candidates(
+        self,
+        snapshot: IndexSnapshot,
+        query: str,
+        query_vector: np.ndarray,
+        allowed: np.ndarray,
+    ) -> list[int]:
+        lexical = self._lexical_ranking(snapshot, query, allowed)
+        semantic = self._semantic_ranking(snapshot, query_vector, allowed)
+        return self._fuse(lexical, semantic)
+
+    def _lexical_ranking(
+        self, snapshot: IndexSnapshot, query: str, allowed: np.ndarray
+    ) -> list[int]:
+        if snapshot.lexical is None:
+            return []
+        tokens = RagIndex._tokenize_one(query)
+        if not tokens:
+            return []
+        scores = snapshot.lexical.get_scores(tokens)
+        eligible = [int(index) for index in allowed if scores[index] > 0]
+        return sorted(eligible, key=lambda index: (-float(scores[index]), index))[
+            : self._lexical_limit
+        ]
+
+    def _semantic_ranking(
+        self, snapshot: IndexSnapshot, vector: np.ndarray, allowed: np.ndarray
+    ) -> list[int]:
+        scores = snapshot.vectors[allowed] @ vector
+        pairs = zip(allowed.tolist(), scores.tolist(), strict=True)
+        return [
+            index
+            for index, _ in sorted(pairs, key=lambda item: (-item[1], item[0]))[
+                : self._semantic_limit
+            ]
+        ]
+
+    def _fuse(self, *rankings: list[int]) -> list[int]:
+        scores: dict[int, float] = {}
+        for ranking in rankings:
+            for rank, index in enumerate(ranking, start=1):
+                scores[index] = scores.get(index, 0.0) + 1.0 / (60 + rank)
+        return sorted(scores, key=lambda index: (-scores[index], index))[ : self._candidate_limit]
+
+    @staticmethod
+    def _pick_limit(name: str, primary: int | None, alias: int | None) -> int:
+        if primary is not None and alias is not None and primary != alias:
+            raise ValueError(f"{name} was supplied twice with different values")
+        value = primary if primary is not None else alias
+        if value is None or value <= 0:
+            raise ValueError(f"{name} must be positive")
+        return value
+
+    @staticmethod
+    def _build_snapshot(
+        documents: tuple[DocumentRecord, ...],
+        chunks: tuple[StoredChunk, ...],
+        vectors: np.ndarray,
+    ) -> IndexSnapshot:
+        if not all(isinstance(document, DocumentRecord) for document in documents):
+            raise TypeError("snapshot documents must be DocumentRecord values")
+        if not all(isinstance(chunk, StoredChunk) for chunk in chunks):
+            raise TypeError("snapshot chunks must be StoredChunk values")
+        document_ids = {document.id for document in documents}
+        if len(document_ids) != len(documents):
+            raise ValueError("snapshot documents must have unique identifiers")
+        counts = {document.id: 0 for document in documents}
+        for chunk in chunks:
+            if chunk.document_id not in counts:
+                raise ValueError("snapshot chunk references an unknown document")
+            counts[chunk.document_id] += 1
+        if any(counts[document.id] != document.chunk_count for document in documents):
+            raise ValueError("snapshot document chunk count mismatch")
+
+        matrix = RagService._normalize_rows(
+            vectors, expected_rows=len(chunks), label="persisted embedding"
+        ) if chunks else RagService._empty_matrix(vectors)
+        lexical: bm25s.BM25 | None = None
+        if chunks:
+            lexical = bm25s.BM25()
+            lexical.index(
+                RagIndex._tokenize_many([chunk.text for chunk in chunks]),
+                show_progress=False,
+            )
+        return IndexSnapshot(documents, chunks, matrix, lexical)
+
+    @staticmethod
+    def _empty_matrix(vectors: np.ndarray) -> np.ndarray:
+        matrix = np.asarray(vectors, dtype=np.float32)
+        if matrix.ndim != 2 or matrix.shape[0] != 0:
+            raise ValueError("persisted embedding row count does not match chunks")
+        return np.array(matrix, dtype=np.float32, copy=True, order="C")
+
+    @staticmethod
+    def _normalize_rows(
+        values: object, *, expected_rows: int, label: str
+    ) -> np.ndarray:
+        try:
+            matrix = np.asarray(values, dtype=np.float32)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"invalid {label} values") from exc
+        if matrix.ndim != 2 or matrix.shape[0] != expected_rows:
+            raise ValueError(f"invalid {label} row count")
+        if matrix.shape[1] == 0:
+            raise ValueError(f"invalid {label} dimension")
+        if not np.isfinite(matrix).all():
+            raise ValueError(f"invalid {label}: nonfinite values")
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        if np.any(norms == 0):
+            raise ValueError(f"invalid {label}: zero vector")
+        return np.asarray(matrix / norms, dtype=np.float32)
