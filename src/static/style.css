@@ -39,6 +39,25 @@ body {
     background: var(--primary-color);
 }
 
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); }
+
+.document-upload-form, .session-bar {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--secondary-hover-color);
+}
+
+.document-upload-form input { min-width: 0; width: 100%; color: var(--subheading-color); font-size: .75rem; }
+.document-upload-form button, .session-bar > button, .sessions-list button {
+    border: 0; border-radius: 6px; background: var(--secondary-color); color: var(--text-color); cursor: pointer; padding: 7px;
+}
+.session-bar { min-height: 58px; background: var(--primary-color); }
+.sessions-list { display: flex; gap: 5px; overflow-x: auto; list-style: none; flex: 1; }
+.sessions-list button { white-space: nowrap; color: var(--subheading-color); }
+.sessions-list button.selected, .sessions-list button:hover { background: var(--secondary-hover-color); color: var(--text-color); }
+
 /* App Layout - Sidebar + Main */
 .app-layout {
     display: flex;

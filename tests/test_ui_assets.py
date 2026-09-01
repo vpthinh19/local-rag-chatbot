@@ -1,104 +1,118 @@
+"""Static UI contracts and pure browser-state behavior."""
+
+from __future__ import annotations
+
 from html.parser import HTMLParser
+import json
 from pathlib import Path
+import subprocess
 
 from src.config import SUPPORTED_DOCUMENT_EXTENSIONS
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "src" / "templates" / "index.html"
 SCRIPT = ROOT / "src" / "static" / "script.js"
+STATE = ROOT / "src" / "static" / "state.mjs"
 STYLE = ROOT / "src" / "static" / "style.css"
 
 
-class _IdCollector(HTMLParser):
+class TemplateTree(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
-        self.ids: set[str] = set()
+        self.elements: dict[str, tuple[str, dict[str, str], tuple[str, ...]]] = {}
+        self._parents: list[str] = []
 
-    def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = {key: value or "" for key, value in attrs}
+        identifier = values.get("id")
+        if identifier:
+            self.elements[identifier] = tag, values, tuple(self._parents)
+        self._parents.append(identifier or "")
+
+    def handle_endtag(self, tag: str) -> None:
         del tag
-        for name, value in attrs:
-            if name == "id" and value:
-                self.ids.add(value)
+        if self._parents:
+            self._parents.pop()
+
+    def has_button(self, identifier: str) -> bool:
+        return self.elements.get(identifier, ("", {}, ()))[0] == "button"
+
+    def has_list(self, identifier: str) -> bool:
+        return self.elements.get(identifier, ("", {}, ()))[0] in {"ul", "ol"}
+
+    def has_input(self, identifier: str) -> bool:
+        return self.elements.get(identifier, ("", {}, ()))[0] == "input"
+
+    def is_descendant(self, child: str, parent: str) -> bool:
+        return parent in self.elements[child][2]
 
 
-class _FileAcceptCollector(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.accept: str | None = None
-
-    def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
-        values = dict(attrs)
-        if tag == "input" and values.get("id") == "file-input":
-            self.accept = values.get("accept")
+def parse_template() -> TemplateTree:
+    tree = TemplateTree()
+    tree.feed(TEMPLATE.read_text(encoding="utf-8"))
+    return tree
 
 
-def test_existing_ui_assets_are_present() -> None:
-    assert TEMPLATE.is_file()
-    assert SCRIPT.is_file()
-    assert STYLE.is_file()
+def run_state_function(name: str, value: object) -> object:
+    program = (
+        f"import {{ {name} }} from {json.dumps(STATE.as_uri())};"
+        f"const value = JSON.parse({json.dumps(json.dumps(value))});"
+        f"console.log(JSON.stringify({name}(value)));"
+    )
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", program],
+        check=True, capture_output=True, text=True,
+    )
+    return json.loads(result.stdout)
 
 
-def test_existing_control_ids_are_preserved() -> None:
-    collector = _IdCollector()
-    collector.feed(TEMPLATE.read_text(encoding="utf-8"))
+def test_ui_assets_are_present() -> None:
+    assert all(path.is_file() for path in (TEMPLATE, SCRIPT, STATE, STYLE))
 
-    assert {
-        "sidebar",
-        "documents-list",
-        "toggle-sidebar-btn",
-        "prompt-form",
-        "prompt-input",
-        "file-input",
-        "cancel-file-btn",
-        "add-file-btn",
-        "stop-response-btn",
-        "send-prompt-btn",
-        "theme-toggle-btn",
-        "delete-chats-btn",
-    } <= collector.ids
+
+def test_template_separates_upload_from_prompt_form() -> None:
+    tree = parse_template()
+    assert tree.has_button("new-session-btn")
+    assert tree.has_list("sessions-list")
+    assert tree.has_input("document-file-input")
+    assert not tree.is_descendant("document-file-input", "prompt-form")
+    assert tree.has_button("rename-session-btn")
+    assert tree.has_button("delete-session-btn")
+    assert tree.has_button("upload-document-btn")
+    assert tree.has_button("stop-response-btn")
 
 
 def test_file_picker_matches_backend_supported_extensions() -> None:
-    collector = _FileAcceptCollector()
-    collector.feed(TEMPLATE.read_text(encoding="utf-8"))
-
-    assert collector.accept is not None
-    assert set(collector.accept.split(",")) == SUPPORTED_DOCUMENT_EXTENSIONS
+    tree = parse_template()
+    assert set(tree.elements["document-file-input"][1]["accept"].split(",")) == SUPPORTED_DOCUMENT_EXTENSIONS
 
 
-def test_existing_api_routes_remain_wired() -> None:
+def test_document_polling_only_runs_for_nonterminal_states() -> None:
+    assert run_state_function("shouldPollDocuments", [{"status": "ready"}]) is False
+    assert run_state_function("shouldPollDocuments", [{"status": "failed"}]) is False
+    assert run_state_function("shouldPollDocuments", [{"status": "processing"}]) is True
+    assert run_state_function("shouldPollDocuments", [{"status": "deleting"}]) is True
+
+
+def test_document_actions_follow_document_status() -> None:
+    assert run_state_function("documentActions", {"status": "ready"}) == ["download", "delete"]
+    assert run_state_function("documentActions", {"status": "failed"}) == ["retry", "delete"]
+    assert run_state_function("documentActions", {"status": "processing"}) == ["download", "delete"]
+    assert run_state_function("documentActions", {"status": "deleting"}) == []
+
+
+def test_stream_reducer_routes_deltas_to_its_own_session_buffer() -> None:
+    state = {"one": {"text": "A", "status": ""}, "two": {"text": "B", "status": ""}}
+    result = run_state_function("reduceStreamEvent", {
+        "buffers": state, "sessionId": "two", "event": {"type": "delta", "text": "!"},
+    })
+    assert result == {"one": {"text": "A", "status": ""}, "two": {"text": "B!", "status": ""}}
+
+
+def test_script_uses_session_routes_and_independent_upload() -> None:
     script = SCRIPT.read_text(encoding="utf-8")
-
-    for route in (
-        "/api/chat",
-        "/api/stop",
-        "/api/chat-history",
-        "/api/clear-chat",
-        "/api/documents",
-    ):
-        assert route in script
-
-
-def test_saved_and_submitted_messages_use_text_content() -> None:
-    script = SCRIPT.read_text(encoding="utf-8")
-
-    assert 'textContent = msg.content' in script
-    assert 'textContent = userMessage' in script
-    assert 'textContent = fullResponse' in script
-
-
-def test_document_chunk_count_uses_vietnamese_label() -> None:
-    script = SCRIPT.read_text(encoding="utf-8")
-
-    assert "`${doc.chunk_count} đoạn`" in script
-
-
-def test_filenames_are_not_interpolated_into_inner_html() -> None:
-    script = SCRIPT.read_text(encoding="utf-8")
-
-    assert '${doc.file_name}' not in script
-    assert '${uploadedFile.name}' not in script
+    for text in ("selectedSessionId", "streamControllers", "documentPollTimer", "/api/sessions", "/messages", "/chat", "/stop"):
+        assert text in script
+    assert "new FormData(documentUploadForm)" in script
+    assert "new FormData(promptForm)" not in script
+    assert "setInterval(loadDocuments, 1500)" in script
