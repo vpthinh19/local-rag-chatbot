@@ -1,5 +1,6 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import threading
 
 import numpy as np
 import pytest
@@ -275,6 +276,45 @@ def _snapshot_with(document_id: str, text: str, vector: list[float]) -> IndexSna
     return IndexSnapshot((_record(document_id),), (_stored_chunk(document_id, text),), matrix, lexical)
 
 
+def test_index_snapshot_constructor_normalizes_and_owns_vectors() -> None:
+    source = np.array([[3.0, 4.0]], dtype=np.float32)
+
+    snapshot = IndexSnapshot(
+        (_record("document"),),
+        (_stored_chunk("document", "alpha fact"),),
+        source,
+        None,
+    )
+
+    source[0, 0] = 99.0
+    assert snapshot.vectors.tolist() == [[0.6000000238418579, 0.800000011920929]]
+    assert snapshot.vectors.flags.writeable is False
+
+
+@pytest.mark.parametrize(
+    ("documents", "chunks", "error"),
+    [
+        (
+            (_record("document"),),
+            (_stored_chunk("other", "alpha fact"),),
+            "unknown document",
+        ),
+        (
+            (_record("document", chunk_count=2),),
+            (_stored_chunk("document", "alpha fact"),),
+            "chunk count",
+        ),
+    ],
+)
+def test_index_snapshot_constructor_rejects_misaligned_document_records(
+    documents: tuple[DocumentRecord, ...],
+    chunks: tuple[StoredChunk, ...],
+    error: str,
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        IndexSnapshot(documents, chunks, np.array([[1.0, 0.0]], dtype=np.float32), None)
+
+
 class _PausingModels:
     def __init__(self, query_vector: list[float]) -> None:
         self.query_vector = query_vector
@@ -296,6 +336,38 @@ class _FailingIfEmbeddedModels:
 
     async def rerank(self, query: str, documents: list[str]) -> list[float]:
         return [1.0 for _ in documents]
+
+
+@pytest.mark.asyncio
+async def test_search_normalizes_query_vectors_in_the_cpu_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class QueryModels(_FailingIfEmbeddedModels):
+        async def embed(self, texts: list[str]) -> list[list[float]]:
+            return [[3.0, 4.0] for _ in texts]
+
+    original = RagService._normalize_rows
+    normalization_threads: list[int] = []
+
+    def record_normalization(*args: object, **kwargs: object) -> np.ndarray:
+        normalization_threads.append(threading.get_ident())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        RagService, "_normalize_rows", staticmethod(record_normalization)
+    )
+    event_loop_thread = threading.get_ident()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        rag = RagService(QueryModels(), cpu_executor=executor, **LIMITS)
+        await rag.search(
+            _snapshot_with("document", "alpha fact", [1.0, 0.0]),
+            ["alpha"],
+            [],
+            1,
+        )
+
+    assert normalization_threads
+    assert set(normalization_threads).isdisjoint({event_loop_thread})
 
 
 @pytest.mark.asyncio

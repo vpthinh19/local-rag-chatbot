@@ -8,6 +8,7 @@ import asyncio
 from collections.abc import Sequence
 from concurrent.futures import Executor
 from dataclasses import dataclass
+from functools import partial
 import math
 from typing import Protocol
 
@@ -345,6 +346,48 @@ class _PublicationLock:
         return self._lock.locked()
 
 
+def _validate_snapshot_records(
+    documents: tuple[DocumentRecord, ...], chunks: tuple[StoredChunk, ...]
+) -> None:
+    """Validate durable record membership and declared chunk counts."""
+    if not all(isinstance(document, DocumentRecord) for document in documents):
+        raise TypeError("snapshot documents must be DocumentRecord values")
+    if not all(isinstance(chunk, StoredChunk) for chunk in chunks):
+        raise TypeError("snapshot chunks must be StoredChunk values")
+    document_ids = {document.id for document in documents}
+    if len(document_ids) != len(documents):
+        raise ValueError("snapshot documents must have unique identifiers")
+    counts = {document.id: 0 for document in documents}
+    for chunk in chunks:
+        if chunk.document_id not in counts:
+            raise ValueError("snapshot chunk references an unknown document")
+        counts[chunk.document_id] += 1
+    if any(counts[document.id] != document.chunk_count for document in documents):
+        raise ValueError("snapshot document chunk count mismatch")
+
+
+def _normalize_rows(
+    values: object, *, expected_rows: int, label: str
+) -> np.ndarray:
+    """Validate and L2-normalize a complete vector matrix."""
+    try:
+        matrix = np.asarray(values, dtype=np.float32)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"invalid {label} values") from exc
+    if matrix.ndim != 2 or matrix.shape[0] != expected_rows:
+        raise ValueError(f"invalid {label} row count")
+    if matrix.shape[1] == 0 and expected_rows:
+        raise ValueError(f"invalid {label} dimension")
+    if not np.isfinite(matrix).all():
+        raise ValueError(f"invalid {label}: nonfinite values")
+    if not expected_rows:
+        return np.array(matrix, dtype=np.float32, copy=True, order="C")
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    if np.any(norms == 0):
+        raise ValueError(f"invalid {label}: zero vector")
+    return np.asarray(matrix / norms, dtype=np.float32)
+
+
 @dataclass(frozen=True, slots=True)
 class IndexSnapshot:
     """An immutable, fully aligned retrieval view of ready durable records."""
@@ -363,16 +406,12 @@ class IndexSnapshot:
             isinstance(chunk, StoredChunk) for chunk in self.chunks
         ):
             raise TypeError("snapshot chunks must be a tuple of StoredChunk values")
-        vectors = np.asarray(self.vectors, dtype=np.float32)
-        if vectors.ndim != 2 or vectors.shape[0] != len(self.chunks):
-            raise ValueError("snapshot vectors must align with chunks")
-        if self.chunks and vectors.shape[1] == 0:
-            raise ValueError("snapshot vectors must have a dimension")
-        if not np.isfinite(vectors).all():
-            raise ValueError("snapshot vectors must be finite")
-        if vectors.shape[0] and np.any(np.linalg.norm(vectors, axis=1) == 0):
-            raise ValueError("snapshot vectors must not contain zero rows")
-        detached = np.array(vectors, dtype=np.float32, copy=True, order="C")
+        _validate_snapshot_records(self.documents, self.chunks)
+        detached = _normalize_rows(
+            self.vectors,
+            expected_rows=len(self.chunks),
+            label="snapshot vector",
+        )
         detached.setflags(write=False)
         object.__setattr__(self, "vectors", detached)
 
@@ -522,12 +561,17 @@ class RagService:
     async def _embed_batched(self, texts: list[str]) -> np.ndarray:
         rows: list[list[float]] = []
         dimension: int | None = None
+        loop = asyncio.get_running_loop()
         for start in range(0, len(texts), self._batch_size):
             values = await self._models.embed(texts[start : start + self._batch_size])
-            matrix = self._normalize_rows(
-                values,
-                expected_rows=min(self._batch_size, len(texts) - start),
-                label="query embedding",
+            matrix = await loop.run_in_executor(
+                self._cpu_executor,
+                partial(
+                    self._normalize_rows,
+                    values,
+                    expected_rows=min(self._batch_size, len(texts) - start),
+                    label="query embedding",
+                ),
             )
             if dimension is None:
                 dimension = matrix.shape[1]
@@ -595,24 +639,7 @@ class RagService:
         chunks: tuple[StoredChunk, ...],
         vectors: np.ndarray,
     ) -> IndexSnapshot:
-        if not all(isinstance(document, DocumentRecord) for document in documents):
-            raise TypeError("snapshot documents must be DocumentRecord values")
-        if not all(isinstance(chunk, StoredChunk) for chunk in chunks):
-            raise TypeError("snapshot chunks must be StoredChunk values")
-        document_ids = {document.id for document in documents}
-        if len(document_ids) != len(documents):
-            raise ValueError("snapshot documents must have unique identifiers")
-        counts = {document.id: 0 for document in documents}
-        for chunk in chunks:
-            if chunk.document_id not in counts:
-                raise ValueError("snapshot chunk references an unknown document")
-            counts[chunk.document_id] += 1
-        if any(counts[document.id] != document.chunk_count for document in documents):
-            raise ValueError("snapshot document chunk count mismatch")
-
-        matrix = RagService._normalize_rows(
-            vectors, expected_rows=len(chunks), label="persisted embedding"
-        ) if chunks else RagService._empty_matrix(vectors)
+        _validate_snapshot_records(documents, chunks)
         lexical: bm25s.BM25 | None = None
         if chunks:
             lexical = bm25s.BM25()
@@ -620,30 +647,10 @@ class RagService:
                 RagIndex._tokenize_many([chunk.text for chunk in chunks]),
                 show_progress=False,
             )
-        return IndexSnapshot(documents, chunks, matrix, lexical)
-
-    @staticmethod
-    def _empty_matrix(vectors: np.ndarray) -> np.ndarray:
-        matrix = np.asarray(vectors, dtype=np.float32)
-        if matrix.ndim != 2 or matrix.shape[0] != 0:
-            raise ValueError("persisted embedding row count does not match chunks")
-        return np.array(matrix, dtype=np.float32, copy=True, order="C")
+        return IndexSnapshot(documents, chunks, vectors, lexical)
 
     @staticmethod
     def _normalize_rows(
         values: object, *, expected_rows: int, label: str
     ) -> np.ndarray:
-        try:
-            matrix = np.asarray(values, dtype=np.float32)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(f"invalid {label} values") from exc
-        if matrix.ndim != 2 or matrix.shape[0] != expected_rows:
-            raise ValueError(f"invalid {label} row count")
-        if matrix.shape[1] == 0:
-            raise ValueError(f"invalid {label} dimension")
-        if not np.isfinite(matrix).all():
-            raise ValueError(f"invalid {label}: nonfinite values")
-        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-        if np.any(norms == 0):
-            raise ValueError(f"invalid {label}: zero vector")
-        return np.asarray(matrix / norms, dtype=np.float32)
+        return _normalize_rows(values, expected_rows=expected_rows, label=label)
