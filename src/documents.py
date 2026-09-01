@@ -1,27 +1,75 @@
 """Document staging, disposable parser lifecycle, and atomic corpus commits."""
 
+from __future__ import annotations
+
 import asyncio
-from contextlib import suppress
 from dataclasses import dataclass, field
 import inspect
-import json
 import os
 from pathlib import Path
 import re
 import shutil
-import signal
-import sys
+import tempfile
+import time
 from typing import Any, Awaitable, TypeVar
 from uuid import uuid4
 
 from src.config import SUPPORTED_DOCUMENT_EXTENSIONS, Settings
+from src.database import Database
 from src.llama import LlamaClient
-from src.models import Chunk, Corpus, DataValidationError, Document
+from src.models import Chunk, Corpus, DataValidationError, Document, DocumentRecord
+from src.parser import ParserService
 from src.rag import RagIndex
 
 
 _T = TypeVar("_T")
 _SAFE_CHAR = re.compile(r"[^\w .()-]+", re.UNICODE)
+_UPLOAD_CHUNK_BYTES = 1024 * 1024
+_MEDIA_TYPES: dict[str, frozenset[str]] = {
+    ".pdf": frozenset({"application/pdf"}),
+    ".csv": frozenset({"text/csv", "application/csv"}),
+    ".tsv": frozenset({"text/tab-separated-values"}),
+    ".doc": frozenset({"application/msword"}),
+    ".docm": frozenset(
+        {"application/vnd.ms-word.document.macroenabled.12"}
+    ),
+    ".docx": frozenset(
+        {"application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
+    ),
+    ".key": frozenset({"application/x-iwork-keynote-sffkey"}),
+    ".numbers": frozenset({"application/x-iwork-numbers-sffnumbers"}),
+    ".odp": frozenset({"application/vnd.oasis.opendocument.presentation"}),
+    ".ods": frozenset({"application/vnd.oasis.opendocument.spreadsheet"}),
+    ".odt": frozenset({"application/vnd.oasis.opendocument.text"}),
+    ".pages": frozenset({"application/x-iwork-pages-sffpages"}),
+    ".ppt": frozenset({"application/vnd.ms-powerpoint"}),
+    ".pptm": frozenset(
+        {"application/vnd.ms-powerpoint.presentation.macroenabled.12"}
+    ),
+    ".pptx": frozenset(
+        {"application/vnd.openxmlformats-officedocument.presentationml.presentation"}
+    ),
+    ".rtf": frozenset({"application/rtf", "text/rtf"}),
+    ".xls": frozenset({"application/vnd.ms-excel"}),
+    ".xlsm": frozenset(
+        {"application/vnd.ms-excel.sheet.macroenabled.12"}
+    ),
+    ".xlsx": frozenset(
+        {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+    ),
+}
+for _image_extension in (
+    ".bmp",
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".tiff",
+    ".webp",
+):
+    _MEDIA_TYPES[_image_extension] = frozenset({f"image/{_image_extension[1:]}"})
+_MEDIA_TYPES[".jpg"] = frozenset({"image/jpeg"})
+_MEDIA_TYPES[".svg"] = frozenset({"image/svg+xml"})
 
 
 @dataclass(slots=True)
@@ -48,15 +96,305 @@ class DocumentService:
     def __init__(
         self,
         settings: Settings,
-        llama: LlamaClient,
-        live_corpus: LiveCorpus,
-        rag: RagIndex,
+        database_or_llama: Database | LlamaClient,
+        live_corpus: LiveCorpus | None = None,
+        rag: RagIndex | None = None,
     ) -> None:
-        """Bind storage, model, corpus, and retrieval collaborators."""
+        """Bind durable intake, or retain the legacy synchronous ingestion surface."""
         self._settings = settings
-        self._llama = llama
-        self._live = live_corpus
-        self._rag = rag
+        self._database: Database | None = None
+        self._parser = ParserService(settings)
+        self._llama: LlamaClient | None = None
+        self._live: LiveCorpus | None = None
+        self._rag: RagIndex | None = None
+        if isinstance(database_or_llama, Database):
+            if live_corpus is not None or rag is not None:
+                raise TypeError("durable DocumentService accepts only settings and database")
+            self._database = database_or_llama
+        else:
+            if live_corpus is None or rag is None:
+                raise TypeError("legacy DocumentService requires corpus and RAG collaborators")
+            self._llama = database_or_llama
+            self._live = live_corpus
+            self._rag = rag
+
+    async def create_upload(self, upload: Any) -> DocumentRecord:
+        """Durably accept one bounded source file and queue, but never parse, it."""
+        database = self._require_database()
+        file_name = self._safe_name(getattr(upload, "filename", None))
+        media_type = self._media_type(file_name, getattr(upload, "content_type", None))
+        staged_path = await self._stream_to_staging(upload)
+        document_id = uuid4().hex
+        committed_path = self.source_path(document_id)
+        now = time.time()
+        document = DocumentRecord(
+            document_id,
+            file_name,
+            media_type,
+            "processing",
+            "",
+            0,
+            "",
+            now,
+            now,
+        )
+        try:
+            self._settings.uploads_dir.mkdir(parents=True, exist_ok=True)
+            os.replace(staged_path, committed_path)
+
+            def insert(conn: Any) -> DocumentRecord:
+                conn.execute(
+                    "INSERT INTO documents("
+                    "id, file_name, media_type, status, overview, chunk_count, error, "
+                    "created_at, updated_at"
+                    ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        document.id,
+                        document.file_name,
+                        document.media_type,
+                        document.status,
+                        document.overview,
+                        document.chunk_count,
+                        document.error,
+                        document.created_at,
+                        document.updated_at,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO document_jobs("
+                    "id, document_id, operation, state, attempts, next_attempt_at, error, "
+                    "created_at, started_at, finished_at"
+                    ") VALUES(?, ?, 'ingest', 'queued', 0, ?, '', ?, NULL, NULL)",
+                    (uuid4().hex, document.id, now, now),
+                )
+                return document
+
+            return await database.write(insert)
+        except BaseException:
+            committed_path.unlink(missing_ok=True)
+            raise
+        finally:
+            staged_path.unlink(missing_ok=True)
+
+    async def list(self) -> list[DocumentRecord]:
+        """Return all durable documents in stable newest-first order."""
+        database = self._require_database()
+        return await database.read(
+            lambda conn: [
+                self._document_record(row)
+                for row in conn.execute(
+                    "SELECT id, file_name, media_type, status, overview, chunk_count, "
+                    "error, created_at, updated_at FROM documents "
+                    "ORDER BY created_at DESC, id DESC"
+                )
+            ]
+        )
+
+    async def get(self, document_id: str) -> DocumentRecord | None:
+        """Look up durable document metadata without exposing a filesystem path."""
+        database = self._require_database()
+        row = await database.read(
+            lambda conn: conn.execute(
+                "SELECT id, file_name, media_type, status, overview, chunk_count, "
+                "error, created_at, updated_at FROM documents WHERE id = ?",
+                (document_id,),
+            ).fetchone()
+        )
+        return None if row is None else self._document_record(row)
+
+    async def retry(self, document_id: str) -> DocumentRecord:
+        """Move exactly one failed document back to processing and queue ingestion."""
+        database = self._require_database()
+        now = time.time()
+
+        def retry_document(conn: Any) -> DocumentRecord:
+            row = conn.execute(
+                "SELECT id, file_name, media_type, status, overview, chunk_count, "
+                "error, created_at, updated_at FROM documents WHERE id = ?",
+                (document_id,),
+            ).fetchone()
+            if row is None:
+                raise DataValidationError("document does not exist")
+            current = self._document_record(row)
+            if current.status != "failed":
+                raise DataValidationError("only failed documents can be retried")
+            conn.execute(
+                "UPDATE documents SET status = 'processing', error = '', updated_at = ? "
+                "WHERE id = ?",
+                (now, document_id),
+            )
+            conn.execute(
+                "INSERT INTO document_jobs("
+                "id, document_id, operation, state, attempts, next_attempt_at, error, "
+                "created_at, started_at, finished_at"
+                ") VALUES(?, ?, 'ingest', 'queued', 0, ?, '', ?, NULL, NULL)",
+                (uuid4().hex, document_id, now, now),
+            )
+            return DocumentRecord(
+                current.id,
+                current.file_name,
+                current.media_type,
+                "processing",
+                current.overview,
+                current.chunk_count,
+                "",
+                current.created_at,
+                now,
+            )
+
+        return await database.write(retry_document)
+
+    async def schedule_delete(self, document_id: str) -> DocumentRecord:
+        """Atomically hide a document and supersede queued non-delete work."""
+        database = self._require_database()
+        now = time.time()
+
+        def mark_deleting(conn: Any) -> DocumentRecord:
+            row = conn.execute(
+                "SELECT id, file_name, media_type, status, overview, chunk_count, "
+                "error, created_at, updated_at FROM documents WHERE id = ?",
+                (document_id,),
+            ).fetchone()
+            if row is None:
+                raise DataValidationError("document does not exist")
+            current = self._document_record(row)
+            if current.status == "deleting":
+                return current
+            conn.execute(
+                "UPDATE document_jobs SET state = 'cancelled', "
+                "error = 'superseded by delete', finished_at = ? "
+                "WHERE document_id = ? AND operation IN ('ingest', 'reindex') "
+                "AND state = 'queued'",
+                (now, document_id),
+            )
+            conn.execute(
+                "UPDATE documents SET status = 'deleting', updated_at = ? WHERE id = ?",
+                (now, document_id),
+            )
+            conn.execute(
+                "INSERT INTO document_jobs("
+                "id, document_id, operation, state, attempts, next_attempt_at, error, "
+                "created_at, started_at, finished_at"
+                ") VALUES(?, ?, 'delete', 'queued', 0, ?, '', ?, NULL, NULL)",
+                (uuid4().hex, document_id, now, now),
+            )
+            return DocumentRecord(
+                current.id,
+                current.file_name,
+                current.media_type,
+                "deleting",
+                current.overview,
+                current.chunk_count,
+                current.error,
+                current.created_at,
+                now,
+            )
+
+        return await database.write(mark_deleting)
+
+    async def download_path(self, document_id: str) -> Path:
+        """Return a verified committed source path unless deletion has begun."""
+        document = await self.get(document_id)
+        if document is None:
+            raise DataValidationError("document does not exist")
+        if document.status == "deleting":
+            raise DataValidationError("document is not available for download")
+        path = self.source_path(document.id)
+        if not path.is_file():
+            raise DataValidationError("document source file is missing")
+        return path
+
+    async def reconcile_files(self) -> None:
+        """Remove abandoned staging data and committed files with no durable record."""
+        database = self._require_database()
+        self._settings.ensure_dirs()
+        for path in self._settings.staging_dir.iterdir():
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
+        referenced = set(
+            await database.read(
+                lambda conn: [str(row[0]) for row in conn.execute("SELECT id FROM documents")]
+            )
+        )
+        for path in self._settings.uploads_dir.iterdir():
+            if path.is_file() and path.name not in referenced:
+                path.unlink(missing_ok=True)
+
+    def source_path(self, document_id: str) -> Path:
+        """Derive the only permitted committed source path from an opaque ID."""
+        if not isinstance(document_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9_-]{1,128}", document_id
+        ):
+            raise DataValidationError("document ID is invalid")
+        return self._settings.uploads_dir / document_id
+
+    def _require_database(self) -> Database:
+        """Reject durable operations when running through the retained legacy facade."""
+        if self._database is None:
+            raise RuntimeError("durable document storage is not configured")
+        return self._database
+
+    async def _stream_to_staging(self, upload: Any) -> Path:
+        """Copy an upload in fixed-size blocks without retaining its bytes in memory."""
+        read = getattr(upload, "read", None)
+        if read is None:
+            raise TypeError("upload content must be a readable upload")
+        self._settings.staging_dir.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=self._settings.staging_dir,
+            prefix="upload-",
+            suffix=".tmp",
+        )
+        path = Path(temporary_name)
+        total = 0
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                while True:
+                    value = read(_UPLOAD_CHUNK_BYTES)
+                    if inspect.isawaitable(value):
+                        value = await value
+                    if not value:
+                        break
+                    if not isinstance(value, bytes):
+                        raise TypeError("upload reader must return bytes")
+                    total += len(value)
+                    if total > self._settings.max_upload_bytes:
+                        raise DataValidationError("upload exceeds the size limit")
+                    handle.write(value)
+            if total == 0:
+                raise DataValidationError("upload is empty")
+            return path
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+
+    @staticmethod
+    def _document_record(row: Any) -> DocumentRecord:
+        """Construct the immutable domain record at the SQLite boundary."""
+        return DocumentRecord(
+            str(row[0]),
+            str(row[1]),
+            str(row[2]),
+            str(row[3]),
+            str(row[4]),
+            int(row[5]),
+            str(row[6]),
+            float(row[7]),
+            float(row[8]),
+        )
+
+    @staticmethod
+    def _media_type(file_name: str, value: object) -> str:
+        """Require a normalized, supported MIME type for the validated suffix."""
+        if not isinstance(value, str):
+            raise DataValidationError("upload media type is invalid")
+        media_type = value.split(";", 1)[0].strip().lower()
+        allowed = _MEDIA_TYPES.get(Path(file_name).suffix.lower(), frozenset())
+        if media_type not in allowed:
+            raise DataValidationError("upload media type is unsupported")
+        return media_type
 
     async def ingest(
         self,
@@ -70,7 +408,6 @@ class DocumentService:
         file_id = uuid4().hex
         staging = self._settings.staging_dir / request_state.request_id
         staged_input = staging / f"input{extension}"
-        chunks_output = staging / "chunks.json"
         final_upload = self._upload_path(file_id, safe_name)
 
         if staging.exists():
@@ -81,35 +418,9 @@ class DocumentService:
             self._raise_if_cancelled(request_state)
             staged_input.write_bytes(content)
 
-            process = await self._spawn_worker(
-                [
-                    sys.executable,
-                    "-m",
-                    "src.parse_worker",
-                    "--input",
-                    str(staged_input),
-                    "--output",
-                    str(chunks_output),
-                    "--file-id",
-                    file_id,
-                    "--file-name",
-                    safe_name,
-                ]
+            chunks = await self._parse_legacy(
+                file_id, safe_name, staged_input, request_state
             )
-            request_state.parse_process = process
-            try:
-                return_code = await self._wait_for_worker(process, request_state)
-            finally:
-                if request_state.parse_process is process:
-                    request_state.parse_process = None
-            if return_code != 0:
-                detail = await self._worker_error(process)
-                raise RuntimeError(
-                    f"document parser exited with code {return_code}"
-                    + (f": {detail}" if detail else "")
-                )
-
-            chunks = self._load_worker_chunks(chunks_output, file_id, safe_name)
             self._raise_if_cancelled(request_state)
             overview = await self._await_or_cancel(
                 self._create_overview(safe_name, chunks), request_state
@@ -212,60 +523,46 @@ class DocumentService:
             start_new_session=True,
         )
 
-    async def _wait_for_worker(
+    async def _parse_legacy(
         self,
-        process: asyncio.subprocess.Process,
+        document_id: str,
+        file_name: str,
+        source_path: Path,
         state: RequestState,
-    ) -> int:
-        """Wait until the worker exits or request cancellation wins."""
-        wait_task = asyncio.create_task(process.wait())
-        cancel_task = asyncio.create_task(state.cancel_event.wait())
+    ) -> list[Chunk]:
+        """Bridge the old request cancellation state to the shared parser service."""
+        # The forwarding hook keeps the existing testable subprocess seam until
+        # the legacy request pipeline is removed in Task 10.
+        self._parser._spawn_worker = self._spawn_worker
+        work = asyncio.create_task(
+            self._parser.parse(document_id, file_name, source_path)
+        )
+        cancellation = asyncio.create_task(state.cancel_event.wait())
         try:
-            done, _ = await asyncio.wait(
-                {wait_task, cancel_task},
-                timeout=self._settings.parse_timeout_seconds,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if not done:
-                await self._stop_worker_group(process)
-                raise TimeoutError("document parser timed out")
-            if cancel_task in done and state.cancel_event.is_set():
-                await self._stop_worker_group(process)
-                raise asyncio.CancelledError
-            return await wait_task
+            while True:
+                process = self._parser.active_process
+                if process is not None:
+                    state.parse_process = process
+                done, _ = await asyncio.wait(
+                    {work, cancellation},
+                    timeout=0.01,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if work in done:
+                    return await work
+                if cancellation in done and state.cancel_event.is_set():
+                    work.cancel()
+                    await asyncio.gather(work, return_exceptions=True)
+                    raise asyncio.CancelledError
         except asyncio.CancelledError:
-            await self._stop_worker_group(process)
+            work.cancel()
+            await asyncio.gather(work, return_exceptions=True)
             raise
         finally:
-            for task in (wait_task, cancel_task):
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(wait_task, cancel_task, return_exceptions=True)
-
-    async def _stop_worker_group(
-        self, process: asyncio.subprocess.Process
-    ) -> None:
-        """Terminate the worker group, escalating to SIGKILL after grace."""
-        if process.returncode is not None:
-            await process.wait()
-            return
-        try:
-            process_group = os.getpgid(process.pid)
-        except ProcessLookupError:
-            await process.wait()
-            return
-        # Signal the group so OCR helpers cannot outlive their worker parent.
-        with suppress(ProcessLookupError):
-            os.killpg(process_group, signal.SIGTERM)
-        try:
-            await asyncio.wait_for(
-                asyncio.shield(process.wait()),
-                timeout=self._settings.parse_termination_grace_seconds,
-            )
-        except TimeoutError:
-            with suppress(ProcessLookupError):
-                os.killpg(process_group, signal.SIGKILL)
-            await process.wait()
+            state.parse_process = None
+            if not cancellation.done():
+                cancellation.cancel()
+            await asyncio.gather(cancellation, return_exceptions=True)
 
     async def _await_or_cancel(
         self, awaitable: Awaitable[_T], state: RequestState
@@ -349,36 +646,6 @@ class DocumentService:
         if not overview.strip():
             raise DataValidationError("overview model returned empty content")
         return overview.strip()
-
-    @staticmethod
-    async def _worker_error(process: asyncio.subprocess.Process) -> str:
-        """Read a bounded, single-line parser error message."""
-        if process.stderr is None:
-            return ""
-        value = await process.stderr.read(2_048)
-        return " ".join(value.decode("utf-8", errors="replace").split())[:500]
-
-    @staticmethod
-    def _load_worker_chunks(
-        path: Path, file_id: str, file_name: str
-    ) -> list[Chunk]:
-        """Load worker output and verify its upload identity and ordering."""
-        try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-            raw_chunks = value["chunks"]
-        except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError) as exc:
-            raise DataValidationError("parser produced invalid chunks JSON") from exc
-        if not isinstance(raw_chunks, list) or not raw_chunks:
-            raise DataValidationError("parser produced no chunks")
-        chunks = [Chunk.from_dict(item) for item in raw_chunks]
-        if any(
-            chunk.file_id != file_id or chunk.file_name != file_name
-            for chunk in chunks
-        ):
-            raise DataValidationError("parser chunk metadata does not match upload")
-        if [chunk.chunk_id for chunk in chunks] != list(range(len(chunks))):
-            raise DataValidationError("parser chunk IDs are not sequential")
-        return chunks
 
     @staticmethod
     def _safe_name(upload_name: str) -> str:

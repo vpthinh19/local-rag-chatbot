@@ -6,8 +6,10 @@ import sys
 import pytest
 
 from src.config import SUPPORTED_DOCUMENT_EXTENSIONS, Settings
+from src.database import Database
 from src.documents import DocumentService, LiveCorpus, RequestState
-from src.models import Chunk, Corpus, DataValidationError, Document
+from src.models import Chunk, Corpus, DataValidationError, Document, DocumentRecord
+from src.parser import ParserService
 
 
 FAKE_WORKER = Path(__file__).parent / "helpers" / "fake_parse_worker.py"
@@ -166,12 +168,14 @@ async def test_cancelled_worker_group_is_killed_and_reaped(
     monkeypatch.setenv("FAKE_PARSE_MODE", "wait")
     state = RequestState("cancel-worker")
     task = asyncio.create_task(harness.service.ingest("a.pdf", b"content", state))
-    pids_path = harness.settings.staging_dir / state.request_id / "chunks.pids"
+    pids_path: Path | None = None
     for _ in range(200):
-        if pids_path.exists() and state.parse_process is not None:
+        matches = list(harness.settings.staging_dir.rglob("chunks.pids"))
+        if matches and state.parse_process is not None:
+            pids_path = matches[0]
             break
         await asyncio.sleep(0.01)
-    assert pids_path.exists()
+    assert pids_path is not None and pids_path.exists()
     pids = [int(value) for value in pids_path.read_text().split()]
     process = state.parse_process
 
@@ -183,6 +187,12 @@ async def test_cancelled_worker_group_is_killed_and_reaped(
     assert state.parse_process is None
     assert harness.live.value == Corpus()
     assert not (harness.settings.staging_dir / state.request_id).exists()
+    assert not [
+        pending
+        for pending in asyncio.all_tasks()
+        if pending is not asyncio.current_task()
+        and pending.get_coro().__qualname__ == "Process.wait"
+    ]
     for _ in range(200):
         if not any(Path(f"/proc/{pid}").exists() for pid in pids):
             break
@@ -286,6 +296,29 @@ async def test_document_persists_after_ingest_commit(harness: Harness) -> None:
 
 
 @pytest.mark.asyncio
+async def test_legacy_ingest_delegates_parsing_to_parser_service(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, str, Path]] = []
+
+    async def parse(
+        self: ParserService, document_id: str, file_name: str, source_path: Path
+    ) -> list[Chunk]:
+        del self
+        calls.append((document_id, file_name, source_path))
+        return [Chunk(document_id, file_name, 0, ["p. 1"], "meaningful text")]
+
+    monkeypatch.setattr(ParserService, "parse", parse)
+    document = await harness.service.ingest(
+        "report.pdf", b"content", RequestState("parser-service")
+    )
+
+    assert len(calls) == 1
+    assert calls[0][:2] == (document.file_id, "report.pdf")
+    assert calls[0][2].name == "input.pdf"
+
+
+@pytest.mark.asyncio
 async def test_delete_removes_only_selected_document(harness: Harness) -> None:
     first = await harness.service.ingest("first.pdf", b"one", RequestState("first"))
     second = await harness.service.ingest("second.pdf", b"two", RequestState("second"))
@@ -351,3 +384,221 @@ async def test_clear_persists_empty_state_and_removes_uploads(harness: Harness) 
     assert harness.rag.chunks == []
     assert Corpus.load(harness.settings.corpus_path) == Corpus()
     assert list(harness.settings.uploads_dir.iterdir()) == []
+
+
+class UploadStub:
+    """Small async upload double that records the service's stream reads."""
+
+    def __init__(self, filename: str, content: bytes, content_type: str) -> None:
+        self.filename = filename
+        self.content_type = content_type
+        self._content = content
+        self._offset = 0
+        self.read_sizes: list[int] = []
+
+    async def read(self, size: int = -1) -> bytes:
+        self.read_sizes.append(size)
+        if self._offset >= len(self._content):
+            return b""
+        stop = len(self._content) if size < 0 else self._offset + size
+        value = self._content[self._offset : stop]
+        self._offset += len(value)
+        return value
+
+
+async def _durable_documents(tmp_path: Path) -> tuple[Settings, Database, DocumentService]:
+    settings = Settings(data_dir=tmp_path / "durable-data")
+    settings.ensure_dirs()
+    database = Database(settings.database_path, settings.database_busy_timeout_ms)
+    await database.initialize()
+    return settings, database, DocumentService(settings, database)
+
+
+async def _job_states(database: Database, document_id: str) -> list[tuple[str, str]]:
+    return await database.read(
+        lambda conn: [
+            (str(row[0]), str(row[1]))
+            for row in conn.execute(
+                "SELECT operation, state FROM document_jobs "
+                "WHERE document_id = ? ORDER BY created_at, id",
+                (document_id,),
+            )
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_upload_commits_processing_job_without_parsing(tmp_path: Path) -> None:
+    settings, database, documents = await _durable_documents(tmp_path)
+    upload = UploadStub("report.pdf", b"pdf bytes", "application/pdf")
+
+    document = await documents.create_upload(upload)
+
+    assert document.status == "processing"
+    assert documents.source_path(document.id) == settings.uploads_dir / document.id
+    assert documents.source_path(document.id).read_bytes() == b"pdf bytes"
+    assert await _job_states(database, document.id) == [("ingest", "queued")]
+    assert upload.read_sizes == [1024 * 1024, 1024 * 1024]
+
+
+@pytest.mark.asyncio
+async def test_durable_document_lookup_and_listing_return_committed_metadata(
+    tmp_path: Path,
+) -> None:
+    _settings, _database, documents = await _durable_documents(tmp_path)
+    document = await documents.create_upload(
+        UploadStub("report.pdf", b"pdf bytes", "application/pdf")
+    )
+
+    assert await documents.get(document.id) == document
+    assert await documents.list() == [document]
+    assert await documents.get("missing") is None
+
+
+@pytest.mark.asyncio
+async def test_upload_overflow_cleans_its_staging_file(tmp_path: Path) -> None:
+    settings, database, documents = await _durable_documents(tmp_path)
+    upload = UploadStub(
+        "large.pdf", b"x" * (settings.max_upload_bytes + 1), "application/pdf"
+    )
+
+    with pytest.raises(DataValidationError, match="size limit"):
+        await documents.create_upload(upload)
+
+    assert upload.read_sizes[:2] == [1024 * 1024, 1024 * 1024]
+    assert list(settings.staging_dir.iterdir()) == []
+    assert list(settings.uploads_dir.iterdir()) == []
+    assert await database.read(
+        lambda conn: conn.execute("SELECT count(*) FROM documents").fetchone()[0]
+    ) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filename", "media_type"),
+    [
+        ("escape.pdf\x00", "application/pdf"),
+        ("report.txt", "text/plain"),
+        ("report.pdf", "text/plain"),
+    ],
+)
+async def test_upload_rejects_unsafe_or_unsupported_metadata(
+    tmp_path: Path, filename: str, media_type: str
+) -> None:
+    settings, _database, documents = await _durable_documents(tmp_path)
+
+    with pytest.raises(DataValidationError):
+        await documents.create_upload(UploadStub(filename, b"content", media_type))
+
+    assert list(settings.staging_dir.iterdir()) == []
+    assert list(settings.uploads_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_upload_database_failure_removes_only_its_committed_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings, database, documents = await _durable_documents(tmp_path)
+
+    async def fail_write(callback: object) -> object:
+        del callback
+        raise OSError("database unavailable")
+
+    monkeypatch.setattr(database, "write", fail_write)
+    with pytest.raises(OSError, match="database unavailable"):
+        await documents.create_upload(
+            UploadStub("report.pdf", b"content", "application/pdf")
+        )
+
+    assert list(settings.uploads_dir.iterdir()) == []
+    assert list(settings.staging_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_download_is_denied_after_deletion_is_scheduled(tmp_path: Path) -> None:
+    _settings, _database, documents = await _durable_documents(tmp_path)
+    document = await documents.create_upload(
+        UploadStub("report.pdf", b"content", "application/pdf")
+    )
+
+    deleting = await documents.schedule_delete(document.id)
+
+    assert deleting.status == "deleting"
+    with pytest.raises(DataValidationError, match="not available"):
+        await documents.download_path(document.id)
+
+
+@pytest.mark.asyncio
+async def test_retry_requires_a_failed_document_and_queues_new_ingest(
+    tmp_path: Path,
+) -> None:
+    _settings, database, documents = await _durable_documents(tmp_path)
+    document = await documents.create_upload(
+        UploadStub("report.pdf", b"content", "application/pdf")
+    )
+
+    with pytest.raises(DataValidationError, match="failed"):
+        await documents.retry(document.id)
+
+    await database.write(
+        lambda conn: conn.execute(
+            "UPDATE documents SET status = 'failed', error = 'parse failed' WHERE id = ?",
+            (document.id,),
+        )
+    )
+    retried = await documents.retry(document.id)
+
+    assert retried.status == "processing"
+    assert retried.error == ""
+    assert await _job_states(database, document.id) == [
+        ("ingest", "queued"),
+        ("ingest", "queued"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_delete_supersedes_queued_ingest_and_reindex_jobs(tmp_path: Path) -> None:
+    _settings, database, documents = await _durable_documents(tmp_path)
+    document = await documents.create_upload(
+        UploadStub("report.pdf", b"content", "application/pdf")
+    )
+    await database.write(
+        lambda conn: conn.execute(
+            "INSERT INTO document_jobs("
+            "id, document_id, operation, state, attempts, next_attempt_at, error, "
+            "created_at, started_at, finished_at"
+            ") VALUES(?, ?, 'reindex', 'queued', 0, 1.0, '', 1.0, NULL, NULL)",
+            ("reindex-job", document.id),
+        )
+    )
+
+    deleting = await documents.schedule_delete(document.id)
+
+    assert deleting.status == "deleting"
+    assert set(await _job_states(database, document.id)) == {
+        ("ingest", "cancelled"),
+        ("reindex", "cancelled"),
+        ("delete", "queued"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_download_rejects_missing_source_and_reconciliation_removes_orphans(
+    tmp_path: Path,
+) -> None:
+    settings, _database, documents = await _durable_documents(tmp_path)
+    document = await documents.create_upload(
+        UploadStub("report.pdf", b"content", "application/pdf")
+    )
+    documents.source_path(document.id).unlink()
+    orphan = settings.uploads_dir / "orphan"
+    orphan.write_bytes(b"orphan")
+    stale_staging = settings.staging_dir / "stale.tmp"
+    stale_staging.write_bytes(b"stale")
+
+    with pytest.raises(DataValidationError, match="source file is missing"):
+        await documents.download_path(document.id)
+    await documents.reconcile_files()
+
+    assert not orphan.exists()
+    assert list(settings.staging_dir.iterdir()) == []
