@@ -237,7 +237,20 @@ class AgentService:
                         stream_to_cancel.cancel()
                     event_iterator = result.stream_events()
                     yield AgentEvent("start")
-                    async for event in event_iterator:
+                    while True:
+                        pending_event = asyncio.create_task(anext(event_iterator))
+                        try:
+                            event = await asyncio.shield(pending_event)
+                        except StopAsyncIteration:
+                            break
+                        except asyncio.CancelledError:
+                            cancellation_deferred = (
+                                await self._settle_pending_event_shielded(
+                                    session_id, active, pending_event
+                                )
+                                or cancellation_deferred
+                            )
+                            raise
                         if await self._cancellation_recorded(session_id, active):
                             yield AgentEvent("cancelled")
                             return
@@ -286,7 +299,9 @@ class AgentService:
         except asyncio.CancelledError:
             cancellation_deferred = True
         except Exception:
-            pass
+            error_event = error_event or not await self._cancellation_recorded(
+                session_id, active
+            )
         finally:
             if not active.completed and not cleanup_finished:
                 cancellation_deferred = (
@@ -310,27 +325,19 @@ class AgentService:
         """Request safe cancellation of the exact active session stream, if any."""
         async with self._active_lock:
             active = self._active.get(session_id)
-        stream = (
-            await self._request_sdk_cancellation(session_id, active)
-            if active is not None
-            else None
-        )
-        if stream is not None:
-            stream.cancel()
+        if active is not None:
+            await self._request_and_cancel_sdk_run(session_id, active)
 
     async def stop_all(self) -> None:
         """Request cancellation for every active stream without coupling sessions."""
         async with self._active_lock:
             active_runs = tuple(self._active.items())
-        streams = await asyncio.gather(
+        await asyncio.gather(
             *(
-                self._request_sdk_cancellation(session_id, active)
+                self._request_and_cancel_sdk_run(session_id, active)
                 for session_id, active in active_runs
             )
         )
-        for stream in streams:
-            if stream is not None:
-                stream.cancel()
 
     async def _request_sdk_cancellation(
         self, session_id: str, active: _ActiveRun
@@ -406,6 +413,31 @@ class AgentService:
         _result, cancellation_deferred = await self._await_shielded(task)
         return cancellation_deferred
 
+    async def _settle_pending_event_shielded(
+        self,
+        session_id: str,
+        active: _ActiveRun,
+        pending_event: asyncio.Task[object],
+    ) -> bool:
+        """Keep caller cancellation from closing the SDK event iterator mid-next."""
+        task = asyncio.create_task(
+            self._cancel_and_settle_pending_event(session_id, active, pending_event)
+        )
+        _result, cancellation_deferred = await self._await_shielded(task)
+        return cancellation_deferred
+
+    async def _cancel_and_settle_pending_event(
+        self,
+        session_id: str,
+        active: _ActiveRun,
+        pending_event: asyncio.Task[object],
+    ) -> None:
+        await self._request_and_cancel_sdk_run(session_id, active)
+        try:
+            await pending_event
+        except (StopAsyncIteration, asyncio.CancelledError, Exception):
+            pass
+
     async def _finalize_uncommitted(
         self,
         session_id: str,
@@ -454,12 +486,7 @@ class AgentService:
         event_iterator: AsyncIterator[object] | None,
     ) -> None:
         """Cancel and drain one SDK run before releasing its application run slot."""
-        stream = await self._request_sdk_cancellation(session_id, active)
-        if stream is not None:
-            try:
-                stream.cancel()
-            except Exception:
-                pass
+        await self._request_and_cancel_sdk_run(session_id, active)
         if event_iterator is not None:
             try:
                 async for _ in event_iterator:
@@ -470,6 +497,17 @@ class AgentService:
             try:
                 await transaction.discard()
             except (Exception, asyncio.CancelledError):
+                pass
+
+    async def _request_and_cancel_sdk_run(
+        self, session_id: str, active: _ActiveRun
+    ) -> None:
+        """Record cancellation and make the one permitted SDK cancellation request."""
+        stream = await self._request_sdk_cancellation(session_id, active)
+        if stream is not None:
+            try:
+                stream.cancel()
+            except Exception:
                 pass
 
     def _validate_message(self, message: object) -> str:

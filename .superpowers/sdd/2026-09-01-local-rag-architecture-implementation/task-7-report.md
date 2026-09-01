@@ -102,3 +102,21 @@
 - `_ActiveRun` now records `cancellation_requested`, `commit_started`, and `completed`. Cleanup and completed-turn finishing run in independent tasks awaited through a shield/retry loop; repeated caller cancellation is deferred until the iterator/task outcome, active-map removal, and settled event are complete.
 - The event loop checks the service cancellation marker before translating each SDK event. Once marked, queued events are drained only; the caller receives no late delta.
 - The commit linearization point is setting `commit_started` under `_active_lock` after stream completion and final-output validation. Before it, cancellation prevents commit and discards the overlay. After it, cancellation cannot request rollback; the single public `TransactionalSession.commit()` is shielded to a known outcome, then completion/removal is recorded under shield. This deliberately favors one complete durable turn over unsafe public-API compensation, because public SDK session writes cannot be atomically rolled back after a cancellation race.
+
+## Fix round 5 — preserve the SDK iterator on caller cancellation
+
+### RED
+
+- Added a faithful iterator whose `__anext__()` becomes permanently closed if its owner task is cancelled, plus a snapshot-capture failure case. The direct caller-owned iteration path closes that iterator, making cleanup unable to drain the cancellation-resistant run loop before releasing the gate; setup capture exceptions previously produced EOF instead of an `error` event.
+
+### GREEN
+
+- `uv run pytest tests/test_agent.py::test_caller_cancellation_keeps_the_sdk_event_iterator_open_for_drain tests/test_agent.py::test_snapshot_capture_failure_yields_one_error_and_cleans_active -q`: `2 passed`.
+- `uv run pytest tests/test_agent.py tests/test_agent_eval.py -q`: `22 passed, 2 skipped`.
+- `uv run pytest -q`: `280 passed, 7 skipped`.
+
+### Changes and decisions
+
+- `AgentService.stream` now creates one pending `anext(event_iterator)` task at a time and awaits it with `asyncio.shield`. If the caller is cancelled while waiting, the service records/calls SDK cancellation, shield-waits that pending next to settle, then lets the existing in-gate cleanup drain the still-open iterator before releasing the gate or active entry.
+- `stop`, `stop_all`, and cleanup now share the same identity-validated record-and-cancel helper; no new producer or orchestration layer was introduced.
+- The outer setup-exception path records one stable `error` event after cleanup, so snapshot/session/pre-run failures cannot silently end the response. Error contents remain generic application events.

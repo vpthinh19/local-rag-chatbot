@@ -156,6 +156,83 @@ class _DrainOnlyEvents:
         raise AssertionError("unreachable")
 
 
+class _OwnerCancelledStream(_CompletedStream):
+    """Models an SDK iterator that cannot be drained after its owning task is cancelled."""
+
+    def __init__(self, session: TransactionalSession) -> None:
+        super().__init__(session)
+        self.cancel_requested = asyncio.Event()
+        self.allow_settlement = asyncio.Event()
+        self.run_loop_settled = asyncio.Event()
+        self._background_task = asyncio.create_task(self._run_background())
+        self.events = _OwnerCancelledEvents(self)
+
+    async def _run_background(self) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await self.allow_settlement.wait()
+            self.run_loop_settled.set()
+            raise
+
+    def cancel(self) -> None:
+        super().cancel()
+        self.cancel_requested.set()
+        self._background_task.cancel()
+
+    def stream_events(self) -> "_OwnerCancelledEvents":
+        return self.events
+
+
+class _OwnerCancelledEvents:
+    def __init__(self, result: _OwnerCancelledStream) -> None:
+        self._result = result
+        self._first = True
+        self.next_started = asyncio.Event()
+        self.owner_cancelled = False
+        self.iterator_settled = asyncio.Event()
+
+    def __aiter__(self) -> "_OwnerCancelledEvents":
+        return self
+
+    async def __anext__(self) -> object:
+        if self.owner_cancelled:
+            raise StopAsyncIteration
+        if self._first:
+            self._first = False
+            await self._result._session.add_items(
+                [
+                    {"type": "message", "role": "user", "content": "question"},
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": self._result.final_output}],
+                    },
+                ]
+            )
+            return type(
+                "Raw",
+                (),
+                {
+                    "type": "raw_response_event",
+                    "data": type(
+                        "Delta",
+                        (),
+                        {"type": "response.output_text.delta", "delta": self._result.final_output},
+                    )(),
+                },
+            )()
+        self.next_started.set()
+        try:
+            await self._result._background_task
+        except asyncio.CancelledError:
+            if not self._result.cancelled:
+                self.owner_cancelled = True
+                raise
+            self.iterator_settled.set()
+            raise StopAsyncIteration
+
+
 class _BarrierCompletedStream(_CompletedStream):
     """A normally completed result whose final SDK event is test-controlled."""
 
@@ -672,6 +749,60 @@ async def test_stop_winning_the_commit_lock_discards_without_done(agent_harness,
 
     assert (await completing).type == "cancelled"
     assert agent_harness.sessions.sdk_session("s1").items == []
+
+
+@pytest.mark.asyncio
+async def test_caller_cancellation_keeps_the_sdk_event_iterator_open_for_drain(agent_harness, monkeypatch) -> None:
+    """Would fail if caller cancellation directly owned SDK iterator __anext__()."""
+    from src import agent
+
+    agent_harness.service._run_gate = asyncio.Semaphore(1)
+    results: list[_OwnerCancelledStream] = []
+
+    def run_streamed(*args: Any, **kwargs: Any) -> _OwnerCancelledStream:
+        result = _OwnerCancelledStream(kwargs["session"])
+        results.append(result)
+        return result
+
+    monkeypatch.setattr(agent.Runner, "run_streamed", run_streamed)
+    stream = agent_harness.service.stream("s1", "question")
+    assert (await anext(stream)).type == "start"
+    assert (await anext(stream)).type == "delta"
+    active = agent_harness.service._active["s1"]
+    waiting = asyncio.create_task(anext(stream))
+    await results[0].events.next_started.wait()
+    waiting.cancel()
+    await results[0].cancel_requested.wait()
+
+    assert not results[0].events.owner_cancelled
+    assert not waiting.done()
+    assert agent_harness.service._run_gate.locked()
+    assert "s1" in agent_harness.service._active
+    results[0].allow_settlement.set()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+
+    assert results[0].events.iterator_settled.is_set()
+    assert results[0].run_loop_settled.is_set()
+    assert not agent_harness.service._run_gate.locked()
+    assert "s1" not in agent_harness.service._active
+    assert active.settled.is_set()
+    assert agent_harness.sessions.sdk_session("s1").items == []
+
+
+@pytest.mark.asyncio
+async def test_snapshot_capture_failure_yields_one_error_and_cleans_active(agent_harness, monkeypatch) -> None:
+    """Setup failures must not turn into an empty stream response."""
+
+    async def fail_capture() -> IndexSnapshot:
+        raise RuntimeError("snapshot unavailable")
+
+    monkeypatch.setattr(agent_harness.store, "capture", fail_capture)
+
+    assert [event.type async for event in agent_harness.service.stream("s1", "question")] == [
+        "error"
+    ]
+    assert "s1" not in agent_harness.service._active
 
 
 @pytest.mark.asyncio
