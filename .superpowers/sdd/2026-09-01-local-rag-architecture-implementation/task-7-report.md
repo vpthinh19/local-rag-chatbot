@@ -81,3 +81,24 @@
 - Uncommitted cleanup now occurs inside the `_run_gate` scope. It records cancellation, calls `cancel()` once when needed, drains the saved `stream_events()` iterator without emitting translated events, then discards the transactional session; only then can the semaphore and active-session entry be released. Cleanup exceptions are suppressed so they cannot mask the original stream exit.
 - Active runs now carry a completed marker. `stop`, `stop_all`, and cleanup cancellation requests verify the current `(session_id, active-object)` mapping under the lock; stale snapshot entries and already committed runs are not cancelled.
 - Capturing cancellation state before cleanup preserves `error` for a genuine empty-final-output validation failure rather than relabeling it as `cancelled`.
+
+## Fix round 4 — shielded terminal state and commit linearization
+
+### RED
+
+- Added deterministic cases for a queued late SDK delta, repeated task cancellation during drain and before gate acquisition, and cancellation during/before the transactional commit window.
+- `uv run pytest tests/test_agent.py::test_stop_suppresses_a_queued_late_delta tests/test_agent.py::test_repeated_cancellation_during_drain_settles_before_propagating tests/test_agent.py::test_repeated_cancellation_before_gate_settles_active_run tests/test_agent.py::test_cancellation_after_commit_linearization_keeps_complete_turn tests/test_agent.py::test_cancellation_before_commit_linearization_discards_the_turn -q`: `4 failed, 1 passed`. The old service emitted the late delta, released terminal state on repeat cancellation, leaked pre-gate state, and lost an interrupted durable append.
+- Added a lock-window regression where stop is queued after final-output validation but before commit linearization. `uv run pytest tests/test_agent.py::test_stop_winning_the_commit_lock_discards_without_done -q`: `1 failed`; the old branch emitted `done` after cancellation had won the commit lock.
+
+### GREEN
+
+- `uv run pytest tests/test_agent.py::test_repeated_cancellation_during_drain_settles_before_propagating -q`: `1 passed` after adding deferred cancellation propagation from generator-close cleanup.
+- `uv run pytest tests/test_agent.py::test_stop_winning_the_commit_lock_discards_without_done tests/test_agent.py::test_stop_suppresses_a_queued_late_delta tests/test_agent.py::test_repeated_cancellation_during_drain_settles_before_propagating tests/test_agent.py::test_repeated_cancellation_before_gate_settles_active_run tests/test_agent.py::test_cancellation_after_commit_linearization_keeps_complete_turn tests/test_agent.py::test_cancellation_before_commit_linearization_discards_the_turn -q`: `6 passed`.
+- `uv run pytest tests/test_agent.py tests/test_agent_eval.py -q`: `20 passed, 2 skipped`.
+- `uv run pytest -q`: `278 passed, 7 skipped`.
+
+### State and technical ruling
+
+- `_ActiveRun` now records `cancellation_requested`, `commit_started`, and `completed`. Cleanup and completed-turn finishing run in independent tasks awaited through a shield/retry loop; repeated caller cancellation is deferred until the iterator/task outcome, active-map removal, and settled event are complete.
+- The event loop checks the service cancellation marker before translating each SDK event. Once marked, queued events are drained only; the caller receives no late delta.
+- The commit linearization point is setting `commit_started` under `_active_lock` after stream completion and final-output validation. Before it, cancellation prevents commit and discards the overlay. After it, cancellation cannot request rollback; the single public `TransactionalSession.commit()` is shielded to a known outcome, then completion/removal is recorded under shield. This deliberately favors one complete durable turn over unsafe public-API compensation, because public SDK session writes cannot be atomically rolled back after a cancellation race.

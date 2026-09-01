@@ -155,6 +155,7 @@ class _ActiveRun:
     stream: Any | None = None
     cancellation_requested: bool = False
     sdk_cancel_requested: bool = False
+    commit_started: bool = False
     completed: bool = False
 
 
@@ -194,10 +195,10 @@ class AgentService:
             self._active[session_id] = active
 
         transaction: TransactionalSession | None = None
-        committed = False
-        cancelled = False
-        inner_cleanup_finished = False
         event_iterator: AsyncIterator[object] | None = None
+        cleanup_finished = False
+        cancellation_deferred = False
+        error_event = False
         try:
             snapshot = await self._snapshots.capture()
             transaction = TransactionalSession(self._sessions.sdk_session(session_id))
@@ -237,59 +238,73 @@ class AgentService:
                     event_iterator = result.stream_events()
                     yield AgentEvent("start")
                     async for event in event_iterator:
+                        if await self._cancellation_recorded(session_id, active):
+                            yield AgentEvent("cancelled")
+                            return
                         translated = self._translate(event)
                         if translated is not None:
                             yield translated
-                    async with self._active_lock:
-                        cancelled = active.cancellation_requested or not bool(
-                            getattr(result, "is_complete", False)
-                        )
                     failure = getattr(result, "run_loop_exception", None)
                     if failure is not None:
                         raise failure
-                    if cancelled:
+                    if (
+                        await self._cancellation_recorded(session_id, active)
+                        or not bool(getattr(result, "is_complete", False))
+                    ):
                         yield AgentEvent("cancelled")
                         return
                     answer = getattr(result, "final_output", None)
                     if not isinstance(answer, str) or not answer.strip():
                         raise ValueError("agent returned an empty final answer")
-                    async with self._active_lock:
-                        if active.cancellation_requested:
-                            cancelled = True
-                        else:
-                            await transaction.commit()
-                            committed = True
-                            active.completed = True
-                            if self._active.get(session_id) is active:
-                                del self._active[session_id]
-                    if cancelled:
+                    commit_cancelled, commit_cancellation_deferred = await self._commit_complete(
+                        session_id, active, transaction
+                    )
+                    cancellation_deferred = (
+                        cancellation_deferred or commit_cancellation_deferred
+                    )
+                    if commit_cancelled:
                         yield AgentEvent("cancelled")
                         return
-                    yield AgentEvent("done")
+                    if not cancellation_deferred:
+                        yield AgentEvent("done")
                 except Exception:
-                    async with self._active_lock:
-                        cancelled = active.cancellation_requested
+                    error_event = not await self._cancellation_recorded(session_id, active)
                     raise
                 finally:
-                    if not committed:
-                        await self._cleanup_uncommitted(
-                            session_id, active, transaction, event_iterator
+                    if not active.completed:
+                        inner_cancellation_deferred = (
+                            await self._finalize_uncommitted_shielded(
+                                session_id, active, transaction, event_iterator
+                            )
                         )
-                        inner_cleanup_finished = True
+                        cancellation_deferred = (
+                            inner_cancellation_deferred or cancellation_deferred
+                        )
+                        cleanup_finished = True
+                        if inner_cancellation_deferred:
+                            raise asyncio.CancelledError
         except asyncio.CancelledError:
-            cancelled = True
-            raise
+            cancellation_deferred = True
         except Exception:
-            yield AgentEvent("cancelled" if cancelled else "error")
+            pass
         finally:
-            if not committed and not inner_cleanup_finished:
-                await self._cleanup_uncommitted(
-                    session_id, active, transaction, event_iterator
+            if not active.completed and not cleanup_finished:
+                cancellation_deferred = (
+                    await self._finalize_uncommitted_shielded(
+                        session_id, active, transaction, event_iterator
+                    )
+                    or cancellation_deferred
                 )
-            active.settled.set()
-            async with self._active_lock:
-                if self._active.get(session_id) is active:
-                    del self._active[session_id]
+                cleanup_finished = True
+            if active.completed:
+                cancellation_deferred = (
+                    await self._finish_completed_shielded(session_id, active)
+                    or cancellation_deferred
+                )
+        if cancellation_deferred:
+            raise asyncio.CancelledError
+        if error_event:
+            yield AgentEvent("error")
 
     async def stop(self, session_id: str) -> None:
         """Request safe cancellation of the exact active session stream, if any."""
@@ -322,7 +337,11 @@ class AgentService:
     ) -> Any | None:
         """Record cancellation before requesting the matching SDK stream to stop."""
         async with self._active_lock:
-            if self._active.get(session_id) is not active or active.completed:
+            if (
+                self._active.get(session_id) is not active
+                or active.completed
+                or active.commit_started
+            ):
                 return None
             active.cancellation_requested = True
             if (
@@ -333,6 +352,99 @@ class AgentService:
                 return None
             active.sdk_cancel_requested = True
             return active.stream
+
+    async def _cancellation_recorded(self, session_id: str, active: _ActiveRun) -> bool:
+        """Read cancellation only while this exact active run remains cancellable."""
+        async with self._active_lock:
+            return (
+                self._active.get(session_id) is active
+                and active.cancellation_requested
+                and not active.commit_started
+            )
+
+    async def _commit_complete(
+        self,
+        session_id: str,
+        active: _ActiveRun,
+        transaction: TransactionalSession,
+    ) -> tuple[bool, bool]:
+        """Cross the durable-turn linearization point and finish its single append."""
+        async with self._active_lock:
+            if (
+                self._active.get(session_id) is not active
+                or active.cancellation_requested
+            ):
+                return True, False
+            active.commit_started = True
+        commit_task = asyncio.create_task(transaction.commit())
+        _result, cancellation_deferred = await self._await_shielded(commit_task)
+        mark_task = asyncio.create_task(self._mark_completed(active))
+        _result, mark_cancellation_deferred = await self._await_shielded(mark_task)
+        cancellation_deferred = cancellation_deferred or mark_cancellation_deferred
+        cancellation_deferred = (
+            await self._finish_completed_shielded(session_id, active)
+            or cancellation_deferred
+        )
+        return False, cancellation_deferred
+
+    async def _mark_completed(self, active: _ActiveRun) -> None:
+        """Record the known-successful durable append before any cancellation can unwind."""
+        async with self._active_lock:
+            active.completed = True
+
+    async def _finalize_uncommitted_shielded(
+        self,
+        session_id: str,
+        active: _ActiveRun,
+        transaction: TransactionalSession | None,
+        event_iterator: AsyncIterator[object] | None,
+    ) -> bool:
+        """Settle uncommitted SDK work despite repeated caller cancellation."""
+        task = asyncio.create_task(
+            self._finalize_uncommitted(session_id, active, transaction, event_iterator)
+        )
+        _result, cancellation_deferred = await self._await_shielded(task)
+        return cancellation_deferred
+
+    async def _finalize_uncommitted(
+        self,
+        session_id: str,
+        active: _ActiveRun,
+        transaction: TransactionalSession | None,
+        event_iterator: AsyncIterator[object] | None,
+    ) -> None:
+        await self._cleanup_uncommitted(session_id, active, transaction, event_iterator)
+        await self._remove_active(session_id, active)
+
+    async def _finish_completed_shielded(
+        self, session_id: str, active: _ActiveRun
+    ) -> bool:
+        """Publish a completed durable turn before deferred cancellation propagates."""
+        task = asyncio.create_task(self._remove_active(session_id, active))
+        _result, cancellation_deferred = await self._await_shielded(task)
+        return cancellation_deferred
+
+    async def _remove_active(self, session_id: str, active: _ActiveRun) -> None:
+        """Release the exact active-session record after its terminal outcome is known."""
+        async with self._active_lock:
+            if self._active.get(session_id) is active:
+                del self._active[session_id]
+        active.settled.set()
+
+    @staticmethod
+    async def _await_shielded(task: asyncio.Task[Any]) -> tuple[Any, bool]:
+        """Await a terminal task through repeated cancellation, deferring propagation."""
+        cancellation_deferred = False
+        while True:
+            try:
+                return await asyncio.shield(task), cancellation_deferred
+            except asyncio.CancelledError:
+                if task.done():
+                    raise
+                cancellation_deferred = True
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
 
     async def _cleanup_uncommitted(
         self,

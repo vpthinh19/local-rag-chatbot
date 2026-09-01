@@ -177,6 +177,45 @@ class _BarrierCompletedStream(_CompletedStream):
             yield None
 
 
+class _QueuedLateStream(_CompletedStream):
+    """Models an SDK queue with a delta already enqueued when stop is requested."""
+
+    async def stream_events(self):
+        await self._session.add_items(
+            [{"type": "message", "role": "user", "content": "question"}]
+        )
+        yield type(
+            "Raw",
+            (),
+            {
+                "type": "raw_response_event",
+                "data": type("Delta", (), {"type": "response.output_text.delta", "delta": "early"})(),
+            },
+        )()
+        yield type(
+            "Raw",
+            (),
+            {
+                "type": "raw_response_event",
+                "data": type("Delta", (), {"type": "response.output_text.delta", "delta": "late"})(),
+            },
+        )()
+
+
+class _CommitBarrierSession(_Session):
+    """The durable add completes only after the test releases the commit window."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.commit_started = asyncio.Event()
+        self.allow_commit = asyncio.Event()
+
+    async def add_items(self, items: list[Any]) -> None:
+        self.commit_started.set()
+        await self.allow_commit.wait()
+        self.items.extend(items)
+
+
 def _document(document_id: str, *, status: str = "ready", overview: str = "Tóm tắt") -> DocumentRecord:
     return DocumentRecord(document_id, f"{document_id}.pdf", "application/pdf", status, overview, 1, "", 1.0, 1.0)
 
@@ -414,6 +453,225 @@ async def test_stop_all_skips_a_stale_identity_that_committed_before_cancellatio
     await stopping
 
     assert results[0].cancel_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_stop_suppresses_a_queued_late_delta(agent_harness, monkeypatch) -> None:
+    """Would fail if queued SDK output were translated after service cancellation."""
+    from src import agent
+
+    monkeypatch.setattr(
+        agent.Runner,
+        "run_streamed",
+        lambda *args, **kwargs: _QueuedLateStream(kwargs["session"]),
+    )
+    stream = agent_harness.service.stream("s1", "question")
+    assert (await anext(stream)).type == "start"
+    early = await anext(stream)
+    assert (early.type, early.text) == ("delta", "early")
+
+    await agent_harness.service.stop("s1")
+
+    assert [event.type async for event in stream] == ["cancelled"]
+    assert agent_harness.sessions.sdk_session("s1").items == []
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_during_drain_settles_before_propagating(agent_harness, monkeypatch) -> None:
+    """Would fail if a second cancellation released a running SDK cleanup early."""
+    from src import agent
+
+    agent_harness.service._run_gate = asyncio.Semaphore(1)
+    results: list[_BackgroundStream] = []
+
+    def run_streamed(*args: Any, **kwargs: Any) -> _BackgroundStream:
+        result = _BackgroundStream(kwargs["session"])
+        results.append(result)
+        return result
+
+    monkeypatch.setattr(agent.Runner, "run_streamed", run_streamed)
+    stream = agent_harness.service.stream("s1", "question")
+    assert (await anext(stream)).type == "start"
+    assert (await anext(stream)).type == "delta"
+    active = agent_harness.service._active["s1"]
+    closing = asyncio.create_task(stream.aclose())
+    await asyncio.wait_for(results[0].cancel_requested.wait(), timeout=1)
+    closing.cancel()
+    closing.cancel()
+
+    assert not closing.done()
+    assert agent_harness.service._run_gate.locked()
+    assert "s1" in agent_harness.service._active
+    results[0].allow_settlement.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(closing, timeout=1)
+
+    assert results[0].iterator_settled.is_set()
+    assert not agent_harness.service._run_gate.locked()
+    assert "s1" not in agent_harness.service._active
+    assert active.settled.is_set()
+    assert agent_harness.sessions.sdk_session("s1").items == []
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_before_gate_settles_active_run(agent_harness, monkeypatch) -> None:
+    """Would fail if cancellation while snapshot setup ran leaked the active session slot."""
+    from src import agent
+
+    capture_started = asyncio.Event()
+    release_capture = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    original_capture = agent_harness.store.capture
+    original_request = agent_harness.service._request_sdk_cancellation
+
+    async def delayed_capture():
+        capture_started.set()
+        await release_capture.wait()
+        return await original_capture()
+
+    async def delayed_request(*args: Any) -> Any:
+        cleanup_started.set()
+        await release_cleanup.wait()
+        return await original_request(*args)
+
+    monkeypatch.setattr(agent_harness.store, "capture", delayed_capture)
+    monkeypatch.setattr(agent_harness.service, "_request_sdk_cancellation", delayed_request)
+    waiting = asyncio.create_task(anext(agent_harness.service.stream("s1", "question")))
+    await capture_started.wait()
+    active = agent_harness.service._active["s1"]
+    waiting.cancel()
+    await cleanup_started.wait()
+    waiting.cancel()
+
+    assert not waiting.done()
+    assert "s1" in agent_harness.service._active
+    release_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(waiting, timeout=1)
+
+    assert "s1" not in agent_harness.service._active
+    assert active.settled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_commit_linearization_keeps_complete_turn(agent_harness, monkeypatch) -> None:
+    """Would fail if cancelling an in-flight SDK session append left a partial turn."""
+    from src import agent
+
+    durable = _CommitBarrierSession()
+    agent_harness.sessions.sessions["s1"] = durable
+    monkeypatch.setattr(
+        agent.Runner,
+        "run_streamed",
+        lambda *args, **kwargs: _CompletedStream(kwargs["session"]),
+    )
+    stream = agent_harness.service.stream("s1", "question")
+    assert (await anext(stream)).type == "start"
+    assert (await anext(stream)).type == "delta"
+    completing = asyncio.create_task(anext(stream))
+    await durable.commit_started.wait()
+    completing.cancel()
+    durable.allow_commit.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(completing, timeout=1)
+
+    assert len(durable.items) == 2
+    assert "s1" not in agent_harness.service._active
+
+
+@pytest.mark.asyncio
+async def test_cancellation_before_commit_linearization_discards_the_turn(agent_harness, monkeypatch) -> None:
+    """Would fail if a stop admitted a commit after cancellation was already recorded."""
+    from src import agent
+
+    monkeypatch.setattr(
+        agent.Runner,
+        "run_streamed",
+        lambda *args, **kwargs: _CompletedStream(kwargs["session"]),
+    )
+    stream = agent_harness.service.stream("s1", "question")
+    assert (await anext(stream)).type == "start"
+    assert (await anext(stream)).type == "delta"
+    await agent_harness.service.stop("s1")
+
+    assert [event.type async for event in stream] == ["cancelled"]
+    assert agent_harness.sessions.sdk_session("s1").items == []
+
+
+@pytest.mark.asyncio
+async def test_stop_winning_the_commit_lock_discards_without_done(agent_harness, monkeypatch) -> None:
+    """A stop queued between validation and commit linearization still wins the turn."""
+    from src import agent
+
+    class _CountingLock:
+        def __init__(self) -> None:
+            self._lock = asyncio.Lock()
+            self.waiters = 0
+            self.first_waiter = asyncio.Event()
+            self.second_waiter = asyncio.Event()
+            self.manual_task = asyncio.current_task()
+            self.completion_task: asyncio.Task[Any] | None = None
+            self.block_completion = False
+            self.completion_requeued = asyncio.Event()
+            self.allow_completion = asyncio.Event()
+
+        async def acquire(self) -> bool:
+            current = asyncio.current_task()
+            if self.block_completion and current is self.completion_task:
+                self.completion_requeued.set()
+                await self.allow_completion.wait()
+            if self._lock.locked():
+                self.waiters += 1
+                if self.waiters == 1:
+                    self.first_waiter.set()
+                if self.waiters == 2:
+                    self.second_waiter.set()
+            acquired = await self._lock.acquire()
+            if (
+                self.completion_task is None
+                and current is not None
+                and current is not self.manual_task
+            ):
+                self.completion_task = current
+            return acquired
+
+        def release(self) -> None:
+            self._lock.release()
+            if asyncio.current_task() is self.completion_task:
+                self.block_completion = True
+
+        async def __aenter__(self) -> "_CountingLock":
+            await self.acquire()
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            self.release()
+
+    monkeypatch.setattr(
+        agent.Runner,
+        "run_streamed",
+        lambda *args, **kwargs: _CompletedStream(kwargs["session"]),
+    )
+    stream = agent_harness.service.stream("s1", "question")
+    assert (await anext(stream)).type == "start"
+    assert (await anext(stream)).type == "delta"
+
+    lock = _CountingLock()
+    agent_harness.service._active_lock = lock
+    await lock.acquire()
+    completing = asyncio.create_task(anext(stream))
+    await lock.first_waiter.wait()
+    stopping = asyncio.create_task(agent_harness.service.stop("s1"))
+    await lock.second_waiter.wait()
+    lock.release()
+    await stopping
+    await lock.completion_requeued.wait()
+    lock.allow_completion.set()
+
+    assert (await completing).type == "cancelled"
+    assert agent_harness.sessions.sdk_session("s1").items == []
 
 
 @pytest.mark.asyncio
