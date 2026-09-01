@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from shutil import copyfile as shutil_copyfile
 import time
 
 import pytest
 import pytest_asyncio
 
+import src.migration as migration_module
 from src.config import Settings
 from src.database import Database
 from src.migration import migrate_legacy
@@ -150,6 +152,8 @@ async def test_legacy_migration_is_idempotent(migration_harness: MigrationHarnes
     """Would fail if a completed import inserted the same records again."""
     migration_harness.write_corpus_one_document()
     migration_harness.write_history_two_turns()
+    corpus_before = migration_harness.corpus_json.read_bytes()
+    history_before = migration_harness.history_json.read_bytes()
 
     first = await migration_harness.run()
     second = await migration_harness.run()
@@ -159,8 +163,8 @@ async def test_legacy_migration_is_idempotent(migration_harness: MigrationHarnes
     assert await migration_harness.count("documents") == 1
     assert await migration_harness.count("document_jobs") == 1
     assert len(await migration_harness.sdk_items()) == 4
-    assert migration_harness.corpus_json.exists()
-    assert migration_harness.history_json.exists()
+    assert migration_harness.corpus_json.read_bytes() == corpus_before
+    assert migration_harness.history_json.read_bytes() == history_before
     assert (migration_harness.settings.uploads_dir / "doc-one").read_bytes() == b"legacy source"
 
 
@@ -229,6 +233,68 @@ async def test_migration_keeps_an_existing_new_destination(
     await migration_harness.run()
 
     assert destination.read_bytes() == b"existing durable source"
+
+
+@pytest.mark.asyncio
+async def test_interrupted_source_copy_leaves_no_final_file_and_retries(
+    migration_harness: MigrationHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Would fail if an interrupted copy made a partial destination look committed."""
+    migration_harness.write_corpus_one_document()
+    destination = migration_harness.settings.uploads_dir / "doc-one"
+
+    def interrupted_copy(source: Path, target: Path) -> None:
+        del source
+        target.write_bytes(b"partial")
+        raise OSError("copy interrupted")
+
+    monkeypatch.setattr(migration_module.shutil, "copyfile", interrupted_copy)
+    first = await migration_harness.run()
+
+    assert first.imported_documents == 0
+    assert not destination.exists()
+    assert await migration_harness.count("documents") == 0
+    assert await migration_harness.database.read(
+        lambda conn: conn.execute(
+            "SELECT value FROM schema_meta WHERE key = 'legacy_import_v1_corpus'"
+        ).fetchone()
+    ) is None
+
+    monkeypatch.setattr(migration_module.shutil, "copyfile", shutil_copyfile)
+    second = await migration_harness.run()
+
+    assert second.imported_documents == 1
+    assert destination.read_bytes() == b"legacy source"
+
+
+@pytest.mark.asyncio
+async def test_malformed_history_records_are_reported_without_blocking_valid_messages(
+    migration_harness: MigrationHarness,
+) -> None:
+    """Would fail if skipped history records vanished before the durable marker is set."""
+    migration_harness.history_json.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    None,
+                    {"role": "system", "content": "legacy prompt"},
+                    {"role": "user", "content": "Xin chào"},
+                    {"role": "assistant", "content": "Chào bạn"},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    report = await migration_harness.run()
+
+    assert await migration_harness.sdk_items() == [
+        {"role": "user", "content": "Xin chào"},
+        {"role": "assistant", "content": "Chào bạn"},
+    ]
+    assert any("legacy message 0" in error for error in report.errors)
+    assert any("legacy message 1" in error for error in report.errors)
 
 
 @pytest.mark.asyncio

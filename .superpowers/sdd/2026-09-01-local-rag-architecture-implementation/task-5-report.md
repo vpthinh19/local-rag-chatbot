@@ -23,3 +23,25 @@
 ## Concerns
 
 - `uv run ruff check src/migration.py src/database.py src/models.py tests/test_migration.py` could not run because this environment has no `ruff` executable (`Failed to spawn: ruff`). The project’s full pytest suite and whitespace check passed.
+
+## Fix round 1 — atomic copy and history diagnostics
+
+### RED evidence
+
+- Added an interrupted-copy/retry regression and mixed malformed-plus-valid history regression before changing migration production code.
+- `uv run pytest tests/test_migration.py::test_interrupted_source_copy_leaves_no_final_file_and_retries tests/test_migration.py::test_malformed_history_records_are_reported_without_blocking_valid_messages -q` → `2 failed in 0.09s`.
+  - The direct-copy path imported a failed document and left a partial final destination.
+  - Non-mapping and unsupported-role history items produced no report errors.
+
+### GREEN / verification evidence
+
+- Targeted regressions plus idempotence: `3 passed in 0.07s`.
+- `uv run pytest tests/test_migration.py tests/test_database.py tests/test_models.py -q` → `31 passed in 0.41s`.
+- `uv run pytest -q` → `249 passed, 7 skipped in 3.95s`.
+- `git diff --check` → exit 0 with no whitespace errors.
+
+### Changes
+
+- Source copies now write to a unique `.migration-copy` file in `uploads`, atomically publish through a non-replacing hard link, and clean only that known temporary file. A copy error leaves the corpus marker absent so the source can be retried.
+- Every malformed history entry, including non-objects and unsupported roles, produces a bounded report error while valid entries import normally.
+- Idempotence coverage now compares both legacy JSON files byte-for-byte before and after migration.

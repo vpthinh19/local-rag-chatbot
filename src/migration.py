@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import mimetypes
+import os
 from pathlib import Path
 import re
 import shutil
@@ -72,10 +73,11 @@ async def migrate_legacy(
 
     if _COMPLETE_MARKER not in markers:
         if _CORPUS_MARKER not in markers:
-            count, corpus_errors = await _import_corpus(settings, database)
+            count, corpus_errors, corpus_complete = await _import_corpus(settings, database)
             imported_documents += count
             errors.extend(corpus_errors)
-            await _set_marker(database, _CORPUS_MARKER)
+            if corpus_complete:
+                await _set_marker(database, _CORPUS_MARKER)
         if _HISTORY_MARKER not in markers:
             count, history_errors = await _import_history(settings, database, session_factory)
             imported_messages += count
@@ -135,19 +137,21 @@ async def _read_json(path: Path, label: str, errors: list[str]) -> object | None
         return None
 
 
-async def _import_corpus(settings: Settings, database: Database) -> tuple[int, list[str]]:
+async def _import_corpus(
+    settings: Settings, database: Database
+) -> tuple[int, list[str], bool]:
     errors: list[str] = []
     raw = await _read_json(settings.legacy_corpus_path, "corpus", errors)
     if raw is None:
-        return 0, errors
+        return 0, errors, True
     if not isinstance(raw, dict):
-        return 0, [_error("invalid legacy corpus: root must be an object")]
+        return 0, [_error("invalid legacy corpus: root must be an object")], True
     raw_documents = raw.get("documents", raw.get("summaries", []))
     raw_chunks = raw.get("chunks", [])
     if not isinstance(raw_documents, list):
-        return 0, [_error("invalid legacy corpus: documents must be an array")]
+        return 0, [_error("invalid legacy corpus: documents must be an array")], True
     if not isinstance(raw_chunks, list):
-        return 0, [_error("invalid legacy corpus: chunks must be an array")]
+        return 0, [_error("invalid legacy corpus: chunks must be an array")], True
 
     chunks_by_document: dict[str, list[Chunk]] = {}
     for index, value in enumerate(raw_chunks):
@@ -159,6 +163,7 @@ async def _import_corpus(settings: Settings, database: Database) -> tuple[int, l
         chunks_by_document.setdefault(chunk.file_id, []).append(chunk)
 
     imported = 0
+    complete = True
     known_document_ids: set[str] = set()
     for index, value in enumerate(raw_documents):
         try:
@@ -182,18 +187,21 @@ async def _import_corpus(settings: Settings, database: Database) -> tuple[int, l
             errors.append(_error(f"legacy document {index}: chunks do not match metadata"))
             continue
         source_available = await _copy_legacy_source(settings, document, errors)
+        if source_available is None:
+            complete = False
+            continue
         if await _insert_document(database, document, chunks, source_available):
             imported += 1
 
     for document_id in chunks_by_document:
         if document_id not in known_document_ids:
             errors.append(_error(f"legacy chunks reference unknown document: {document_id}"))
-    return imported, errors
+    return imported, errors, complete
 
 
 async def _copy_legacy_source(
     settings: Settings, document: Document, errors: list[str]
-) -> bool:
+) -> bool | None:
     destination = settings.uploads_dir / document.file_id
     if destination.is_file():
         return True
@@ -204,12 +212,26 @@ async def _copy_legacy_source(
     if not source.is_file():
         errors.append(_error(f"legacy source file is missing for {document.file_id}"))
         return False
+    temporary = settings.uploads_dir / f".{document.file_id}.{uuid4().hex}.migration-copy"
     try:
-        await asyncio.to_thread(shutil.copyfile, source, destination)
+        await asyncio.to_thread(_copy_source_atomically, source, temporary, destination)
     except OSError:
         errors.append(_error(f"legacy source file could not be copied for {document.file_id}"))
-        return False
+        return None
     return True
+
+
+def _copy_source_atomically(source: Path, temporary: Path, destination: Path) -> None:
+    """Copy into this run's private file before atomically claiming the final name."""
+    try:
+        shutil.copyfile(source, temporary)
+        try:
+            os.link(temporary, destination)
+        except FileExistsError:
+            if not destination.is_file():
+                raise
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 async def _insert_document(
@@ -278,7 +300,11 @@ async def _import_history(
         return 0, [_error("invalid legacy history: messages must be an array")]
     messages: list[Message] = []
     for index, value in enumerate(raw["messages"]):
-        if not isinstance(value, dict) or value.get("role") not in {"user", "assistant"}:
+        if not isinstance(value, dict):
+            errors.append(_error(f"legacy message {index}: must be an object"))
+            continue
+        if value.get("role") not in {"user", "assistant"}:
+            errors.append(_error(f"legacy message {index}: unsupported role"))
             continue
         try:
             messages.append(Message.from_dict(value))
