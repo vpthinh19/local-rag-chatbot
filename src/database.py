@@ -75,7 +75,15 @@ class Database:
     async def write(self, fn: Callable[[sqlite3.Connection], Result]) -> Result:
         """Run one immediate transaction, rolling it back on every failure."""
         async with self._write_lock:
-            return await asyncio.to_thread(self._write_sync, fn)
+            worker = asyncio.create_task(asyncio.to_thread(self._write_sync, fn))
+            try:
+                return await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                try:
+                    await asyncio.shield(worker)
+                except BaseException:
+                    pass
+                raise
 
     def _connect(self) -> sqlite3.Connection:
         self.path.parent.mkdir(parents=True, exist_ok=True)
