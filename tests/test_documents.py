@@ -516,6 +516,34 @@ async def test_upload_database_failure_removes_only_its_committed_file(
 
 
 @pytest.mark.asyncio
+async def test_rolled_back_upload_removes_its_source_without_a_follow_up_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings, database, documents = await _durable_documents(tmp_path)
+    read_calls = 0
+
+    async def fail_write(callback: object) -> object:
+        del callback
+        raise OSError("database unavailable")
+
+    async def unexpected_read(callback: object) -> object:
+        del callback
+        nonlocal read_calls
+        read_calls += 1
+        raise AssertionError("rolled-back write must not check commit outcome")
+
+    monkeypatch.setattr(database, "write", fail_write)
+    monkeypatch.setattr(database, "read", unexpected_read)
+    with pytest.raises(OSError, match="database unavailable"):
+        await documents.create_upload(
+            UploadStub("report.pdf", b"content", "application/pdf")
+        )
+
+    assert read_calls == 0
+    assert list(settings.uploads_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
 async def test_cancelled_upload_keeps_a_source_when_its_database_write_commits(
     tmp_path: Path,
 ) -> None:
@@ -546,6 +574,52 @@ async def test_cancelled_upload_keeps_a_source_when_its_database_write_commits(
     assert len(records) == 1
     assert documents.source_path(records[0].id).read_bytes() == b"content"
     assert await _job_states(database, records[0].id) == [("ingest", "queued")]
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_waits_for_the_committed_upload_outcome(
+    tmp_path: Path,
+) -> None:
+    settings, database, documents = await _durable_documents(tmp_path)
+    entered_write = Event()
+    release_write = Event()
+    entered_read = Event()
+    release_read = Event()
+    original_write_sync = database._write_sync
+    original_read_sync = database._read_sync
+
+    def commit_after_cancellation(callback: object) -> object:
+        def delayed_callback(connection: object) -> object:
+            entered_write.set()
+            assert release_write.wait(timeout=2.0)
+            return callback(connection)  # type: ignore[operator]
+
+        return original_write_sync(delayed_callback)  # type: ignore[arg-type]
+
+    def delayed_read(callback: object) -> object:
+        entered_read.set()
+        assert release_read.wait(timeout=2.0)
+        return original_read_sync(callback)  # type: ignore[arg-type]
+
+    database._write_sync = commit_after_cancellation  # type: ignore[method-assign]
+    database._read_sync = delayed_read  # type: ignore[method-assign]
+    task = asyncio.create_task(
+        documents.create_upload(UploadStub("report.pdf", b"content", "application/pdf"))
+    )
+    assert await asyncio.to_thread(entered_write.wait, 1.0)
+
+    task.cancel()
+    release_write.set()
+    assert await asyncio.to_thread(entered_read.wait, 1.0)
+    task.cancel()
+    await asyncio.sleep(0.02)
+    assert not task.done()
+
+    release_read.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    records = await documents.list()
+    assert documents.source_path(records[0].id).read_bytes() == b"content"
 
 
 @pytest.mark.asyncio

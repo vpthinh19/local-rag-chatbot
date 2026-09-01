@@ -170,9 +170,12 @@ class DocumentService:
                 return document
 
             return await database.write(insert)
-        except BaseException:
+        except asyncio.CancelledError:
             if not await self._document_write_committed(database, document.id):
                 committed_path.unlink(missing_ok=True)
+            raise
+        except BaseException:
+            committed_path.unlink(missing_ok=True)
             raise
         finally:
             staged_path.unlink(missing_ok=True)
@@ -339,14 +342,25 @@ class DocumentService:
 
     @staticmethod
     async def _document_write_committed(database: Database, document_id: str) -> bool:
-        """Determine whether a write that raised after cancellation committed first."""
-        try:
-            return await database.read(
+        """Drain a cancellation-safe commit check for a write that may have committed."""
+        check = asyncio.create_task(
+            database.read(
                 lambda conn: conn.execute(
                     "SELECT 1 FROM documents WHERE id = ?", (document_id,)
                 ).fetchone()
                 is not None
             )
+        )
+        try:
+            while not check.done():
+                try:
+                    await asyncio.shield(check)
+                except asyncio.CancelledError:
+                    # The caller already has a cancellation to re-raise. Drain the
+                    # outcome check first so repeated cancellation cannot misclassify
+                    # a committed upload as rolled back.
+                    continue
+            return check.result()
         except BaseException:
             # An unknown outcome must retain the source for startup reconciliation;
             # deleting it could corrupt a transaction that did commit.
