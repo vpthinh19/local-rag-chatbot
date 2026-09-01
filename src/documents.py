@@ -11,7 +11,7 @@ import re
 import shutil
 import tempfile
 import time
-from typing import Any, Awaitable, TypeVar
+from typing import Any, Awaitable, Callable, TypeVar
 from uuid import uuid4
 
 from src.config import SUPPORTED_DOCUMENT_EXTENSIONS, Settings
@@ -107,6 +107,7 @@ class DocumentService:
         self._llama: LlamaClient | None = None
         self._live: LiveCorpus | None = None
         self._rag: RagIndex | None = None
+        self._waker: Callable[[], None] | None = None
         if isinstance(database_or_llama, Database):
             if live_corpus is not None or rag is not None:
                 raise TypeError("durable DocumentService accepts only settings and database")
@@ -169,7 +170,9 @@ class DocumentService:
                 )
                 return document
 
-            return await database.write(insert)
+            result = await database.write(insert)
+            self._wake_worker()
+            return result
         except asyncio.CancelledError:
             if not await self._document_write_committed(database, document.id):
                 committed_path.unlink(missing_ok=True)
@@ -246,7 +249,9 @@ class DocumentService:
                 now,
             )
 
-        return await database.write(retry_document)
+        result = await database.write(retry_document)
+        self._wake_worker()
+        return result
 
     async def schedule_delete(self, document_id: str) -> DocumentRecord:
         """Atomically hide a document and supersede queued non-delete work."""
@@ -294,7 +299,17 @@ class DocumentService:
                 now,
             )
 
-        return await database.write(mark_deleting)
+        result = await database.write(mark_deleting)
+        self._wake_worker()
+        return result
+
+    def set_waker(self, waker: Callable[[], None]) -> None:
+        """Register the durable worker's lightweight wake signal."""
+        self._waker = waker
+
+    def _wake_worker(self) -> None:
+        if self._waker is not None:
+            self._waker()
 
     async def download_path(self, document_id: str) -> Path:
         """Return a verified committed source path unless deletion has begun."""
