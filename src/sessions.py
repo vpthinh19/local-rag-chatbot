@@ -223,7 +223,8 @@ class SessionService:
 
         def rename(conn: Any) -> SessionRecord:
             updated = conn.execute(
-                "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?",
+                "UPDATE sessions SET title = ?, "
+                "updated_at = MAX(?, updated_at + 0.000001) WHERE id = ?",
                 (title, now, session_id),
             )
             if updated.rowcount != 1:
@@ -276,9 +277,9 @@ class SessionService:
 
         def touch(conn: Any) -> SessionRecord:
             updated = conn.execute(
-                "UPDATE sessions SET title = CASE WHEN title = ? THEN ? ELSE title END, "
-                "updated_at = ? WHERE id = ?",
-                (_NEW_SESSION_TITLE, title, now, session_id),
+                "UPDATE sessions SET title = CASE WHEN updated_at = created_at THEN ? ELSE title END, "
+                "updated_at = MAX(?, updated_at + 0.000001) WHERE id = ?",
+                (title, now, session_id),
             )
             if updated.rowcount != 1:
                 raise DataValidationError("session does not exist")

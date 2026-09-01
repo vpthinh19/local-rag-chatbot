@@ -83,12 +83,27 @@ class ParserService:
                             f"document parser exited with code {return_code}"
                             + (f": {detail}" if detail else "")
                         )
-                    return await asyncio.to_thread(
-                        self._load_and_validate_worker_chunks,
-                        output_path,
-                        document_id,
-                        file_name,
+                    decoder = asyncio.create_task(
+                        asyncio.to_thread(
+                            self._load_and_validate_worker_chunks,
+                            output_path,
+                            document_id,
+                            file_name,
+                        )
                     )
+                    try:
+                        return await asyncio.shield(decoder)
+                    except asyncio.CancelledError:
+                        while not decoder.done():
+                            try:
+                                await asyncio.shield(decoder)
+                            except asyncio.CancelledError:
+                                continue
+                            except BaseException:
+                                break
+                        if not decoder.cancelled():
+                            decoder.exception()
+                        raise
                 except asyncio.CancelledError:
                     await self._stop_worker_group(process)
                     raise

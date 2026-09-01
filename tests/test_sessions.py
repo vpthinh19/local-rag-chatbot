@@ -244,6 +244,21 @@ async def test_session_metadata_title_projection_and_isolation(
 
 
 @pytest.mark.asyncio
+async def test_new_chat_text_is_not_reused_as_provisional_title_state(
+    session_service: SessionService,
+) -> None:
+    first = await session_service.create()
+    await session_service.touch_from_first_message(first.id, "New chat")
+    await session_service.touch_from_first_message(first.id, "Second message")
+    assert (await session_service.get(first.id)).title == "New chat"  # type: ignore[union-attr]
+
+    manual = await session_service.create()
+    await session_service.rename(manual.id, "New chat")
+    await session_service.touch_from_first_message(manual.id, "Replacement")
+    assert (await session_service.get(manual.id)).title == "New chat"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
 async def test_rename_and_delete_clear_only_the_target_session(
     session_service: SessionService,
 ) -> None:

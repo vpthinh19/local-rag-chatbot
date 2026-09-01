@@ -243,21 +243,36 @@ class DocumentService:
         self._settings.staging_dir.mkdir(parents=True, exist_ok=True)
         descriptor, name = tempfile.mkstemp(dir=self._settings.staging_dir, prefix="upload-", suffix=".tmp")
         path = Path(name)
+        os.close(descriptor)
         total = 0
         try:
-            with os.fdopen(descriptor, "wb") as handle:
-                while True:
-                    value = read(_UPLOAD_CHUNK_BYTES)
-                    if inspect.isawaitable(value):
-                        value = await value
-                    if not value:
-                        break
-                    if not isinstance(value, bytes):
-                        raise TypeError("upload reader must return bytes")
-                    total += len(value)
-                    if total > self._settings.max_upload_bytes:
-                        raise DataValidationError("upload exceeds the size limit")
-                    await asyncio.to_thread(self._write_block, handle, value)
+            while True:
+                value = read(_UPLOAD_CHUNK_BYTES)
+                if inspect.isawaitable(value):
+                    value = await value
+                if not value:
+                    break
+                if not isinstance(value, bytes):
+                    raise TypeError("upload reader must return bytes")
+                total += len(value)
+                if total > self._settings.max_upload_bytes:
+                    raise DataValidationError("upload exceeds the size limit")
+                worker = asyncio.create_task(
+                    asyncio.to_thread(self._write_block, path, value)
+                )
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    while not worker.done():
+                        try:
+                            await asyncio.shield(worker)
+                        except asyncio.CancelledError:
+                            continue
+                        except BaseException:
+                            break
+                    if not worker.cancelled():
+                        worker.exception()
+                    raise
             if not total:
                 raise DataValidationError("upload is empty")
             return path
@@ -270,8 +285,9 @@ class DocumentService:
             self._waker()
 
     @staticmethod
-    def _write_block(handle: Any, value: bytes) -> None:
-        handle.write(value)
+    def _write_block(path: Path, value: bytes) -> None:
+        with path.open("ab") as handle:
+            handle.write(value)
 
     @staticmethod
     def _record(row: Any) -> DocumentRecord:

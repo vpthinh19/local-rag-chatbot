@@ -129,3 +129,39 @@ async def test_upload_writes_blocks_off_event_loop(tmp_path: Path, monkeypatch: 
     event_loop_thread = threading.get_ident()
     await DocumentService(settings, database).create_upload(Upload("report.pdf", b"pdf"))
     assert threads and event_loop_thread not in threads
+
+
+@pytest.mark.asyncio
+async def test_cancelled_upload_settles_blocking_write_before_staging_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(data_dir=tmp_path / "data")
+    database = Database(settings.database_path, 2_000)
+    await database.initialize()
+    entered = Event()
+    release = Event()
+    settled = Event()
+    original = DocumentService._write_block
+
+    def blocked(handle: object, value: bytes) -> None:
+        entered.set()
+        assert release.wait(timeout=2)
+        try:
+            original(handle, value)
+        finally:
+            settled.set()
+
+    monkeypatch.setattr(DocumentService, "_write_block", staticmethod(blocked))
+    task = asyncio.create_task(
+        DocumentService(settings, database).create_upload(Upload("report.pdf", b"pdf"))
+    )
+    assert await asyncio.to_thread(entered.wait, 1)
+    task.cancel()
+    await asyncio.sleep(0)
+    cleaned_before_settlement = not any(settings.staging_dir.iterdir())
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert await asyncio.to_thread(settled.wait, 1)
+    assert not cleaned_before_settlement
+    assert list(settings.staging_dir.iterdir()) == []
