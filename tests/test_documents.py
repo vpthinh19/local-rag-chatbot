@@ -1,4 +1,7 @@
 from pathlib import Path
+from threading import Event
+
+import asyncio
 
 import pytest
 
@@ -40,3 +43,42 @@ async def test_upload_rejects_untrusted_metadata_before_committing(tmp_path: Pat
     await database.initialize()
     with pytest.raises(DataValidationError):
         await DocumentService(settings, database).create_upload(Upload("bad.txt", b"x", "text/plain"))
+
+
+@pytest.mark.asyncio
+async def test_cancelled_upload_keeps_source_after_its_database_write_commits(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(data_dir=tmp_path / "data")
+    database = Database(settings.database_path, 2_000)
+    await database.initialize()
+    documents = DocumentService(settings, database)
+    entered = Event()
+    release = Event()
+    original_write = database._write_sync
+
+    def commit_after_cancellation(callback: object) -> object:
+        def delayed(connection: object) -> object:
+            entered.set()
+            assert release.wait(timeout=2)
+            return callback(connection)  # type: ignore[operator]
+
+        return original_write(delayed)  # type: ignore[arg-type]
+
+    database._write_sync = commit_after_cancellation  # type: ignore[method-assign]
+    task = asyncio.create_task(documents.create_upload(Upload("report.pdf", b"pdf")))
+    assert await asyncio.to_thread(entered.wait, 1)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    records = await documents.list()
+    assert len(records) == 1
+    assert documents.source_path(records[0].id).read_bytes() == b"pdf"
+    assert await database.read(
+        lambda conn: conn.execute(
+            "SELECT operation, state FROM document_jobs WHERE document_id = ?",
+            (records[0].id,),
+        ).fetchone()
+    ) == ("ingest", "queued")

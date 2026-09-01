@@ -36,6 +36,12 @@ class _Models:
         return [1.0] * len(documents)
 
 
+class _ImmediateModels(_Models):
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        self.embedded = True
+        return [self.vector for _ in texts]
+
+
 @pytest.mark.asyncio
 async def test_search_keeps_its_captured_snapshot_during_publication() -> None:
     old = IndexSnapshot((_document("old"),), (_chunk("old", "alpha"),), np.array([[1.0, 0.0]], dtype=np.float32), None)
@@ -60,6 +66,21 @@ async def test_build_from_persisted_vectors_never_embeds() -> None:
         snapshot = await RagService(models, cpu_executor=executor, **LIMITS).build([_document("d")], [_chunk("d", "fact")], np.array([[3.0, 4.0]], dtype=np.float32))
     assert not models.embedded
     assert snapshot.vectors.tolist() == [[0.6000000238418579, 0.800000011920929]]
+
+
+@pytest.mark.asyncio
+async def test_punctuation_only_query_uses_semantic_ranking_without_bm25_error() -> None:
+    models = _ImmediateModels()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        rag = RagService(models, cpu_executor=executor, **LIMITS)
+        snapshot = await rag.build(
+            [_document("d")],
+            [_chunk("d", "ordinary document text")],
+            np.array([[1.0, 0.0]], dtype=np.float32),
+        )
+        result = await rag.search(snapshot, ["!!!"], [], 1)
+
+    assert [chunk.document_id for chunk in result] == ["d"]
 
 
 @pytest.mark.asyncio

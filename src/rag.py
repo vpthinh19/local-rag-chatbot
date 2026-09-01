@@ -209,8 +209,10 @@ class RagService:
     def _rank(self, snapshot: IndexSnapshot, query: str, vector: np.ndarray, allowed: np.ndarray) -> list[int]:
         lexical: list[int] = []
         if snapshot.lexical is not None:
-            values = snapshot.lexical.get_scores(_tokens([query])[0])
-            lexical = sorted((int(index) for index in allowed if values[index] > 0), key=lambda index: (-float(values[index]), index))[: self._lexical_limit]
+            tokens = _tokens([query])[0]
+            if tokens:
+                values = snapshot.lexical.get_scores(tokens)
+                lexical = sorted((int(index) for index in allowed if values[index] > 0), key=lambda index: (-float(values[index]), index))[: self._lexical_limit]
         semantic_scores = snapshot.vectors[allowed] @ vector
         semantic = [index for index, _ in sorted(zip(allowed.tolist(), semantic_scores.tolist(), strict=True), key=lambda item: (-item[1], item[0]))[: self._semantic_limit]]
         fused: dict[int, float] = {}
