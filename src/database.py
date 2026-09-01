@@ -10,7 +10,7 @@ from typing import TypeVar
 Result = TypeVar("Result")
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_V1_STATEMENTS = (
     "CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)",
@@ -49,6 +49,14 @@ SCHEMA_V1_STATEMENTS = (
     """
     CREATE INDEX IF NOT EXISTS document_jobs_claim
       ON document_jobs(state, next_attempt_at, created_at)
+    """,
+)
+
+SCHEMA_V2_STATEMENTS = (
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS document_jobs_active_reindex
+      ON document_jobs(document_id)
+      WHERE operation = 'reindex' AND state IN ('queued', 'running')
     """,
 )
 
@@ -111,7 +119,14 @@ class Database:
                 for statement in SCHEMA_V1_STATEMENTS[1:]:
                     connection.execute(statement)
                 connection.execute(
-                    "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?)",
+                    "INSERT INTO schema_meta(key, value) VALUES('schema_version', '1')"
+                )
+                current_version = 1
+            if current_version < 2:
+                for statement in SCHEMA_V2_STATEMENTS:
+                    connection.execute(statement)
+                connection.execute(
+                    "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (str(SCHEMA_VERSION),),
                 )
             connection.commit()

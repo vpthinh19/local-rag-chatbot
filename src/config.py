@@ -80,6 +80,9 @@ class Settings:
     parse_timeout_seconds: float = 300.0
     max_parse_pages: int = 200
     tokenizer_name: str = "BAAI/bge-m3"
+    embedding_signature: str = field(
+        default_factory=lambda: os.getenv("EMBEDDING_SIGNATURE", "BAAI/bge-m3")
+    )
 
     # Durable agent, session, and job limits.
     agent_model: str = "local"
@@ -135,6 +138,8 @@ class Settings:
         invalid = [name for name, value in numeric_limits.items() if value <= 0]
         if invalid:
             raise ValueError(f"settings must be positive: {', '.join(invalid)}")
+        if not self.embedding_signature.strip():
+            raise ValueError("embedding_signature must be nonempty")
 
     @property
     def uploads_dir(self) -> Path:

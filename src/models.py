@@ -136,6 +136,27 @@ class SessionRecord:
         _timestamp(self.updated_at, "session.updated_at")
 
 
+@dataclass(frozen=True, slots=True)
+class MigrationReport:
+    """The bounded outcome of one legacy-state migration attempt."""
+
+    imported_documents: int = 0
+    imported_messages: int = 0
+    reindexed_documents: int = 0
+    errors: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Keep the report safe to show in startup logs or diagnostics."""
+        _integer(self.imported_documents, "migration.imported_documents")
+        _integer(self.imported_messages, "migration.imported_messages")
+        _integer(self.reindexed_documents, "migration.reindexed_documents")
+        if not isinstance(self.errors, tuple) or not all(
+            isinstance(error, str) and error and len(error) <= 500
+            for error in self.errors
+        ):
+            raise DataValidationError("migration.errors must contain bounded messages")
+
+
 def _mapping(value: object, label: str) -> Mapping[str, Any]:
     """Validate and return a JSON object."""
     if not isinstance(value, dict):
