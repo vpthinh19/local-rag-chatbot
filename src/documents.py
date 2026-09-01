@@ -259,6 +259,15 @@ class DocumentService:
         now = time.time()
 
         def mark_deleting(conn: Any) -> DocumentRecord:
+            def enqueue_delete() -> None:
+                conn.execute(
+                    "INSERT INTO document_jobs("
+                    "id, document_id, operation, state, attempts, next_attempt_at, error, "
+                    "created_at, started_at, finished_at"
+                    ") VALUES(?, ?, 'delete', 'queued', 0, ?, '', ?, NULL, NULL)",
+                    (uuid4().hex, document_id, now, now),
+                )
+
             row = conn.execute(
                 "SELECT id, file_name, media_type, status, overview, chunk_count, "
                 "error, created_at, updated_at FROM documents WHERE id = ?",
@@ -268,6 +277,13 @@ class DocumentService:
                 raise DataValidationError("document does not exist")
             current = self._document_record(row)
             if current.status == "deleting":
+                active = conn.execute(
+                    "SELECT 1 FROM document_jobs WHERE document_id = ? "
+                    "AND operation = 'delete' AND state IN ('queued', 'running') LIMIT 1",
+                    (document_id,),
+                ).fetchone()
+                if active is None:
+                    enqueue_delete()
                 return current
             conn.execute(
                 "UPDATE document_jobs SET state = 'cancelled', "
@@ -280,13 +296,7 @@ class DocumentService:
                 "UPDATE documents SET status = 'deleting', updated_at = ? WHERE id = ?",
                 (now, document_id),
             )
-            conn.execute(
-                "INSERT INTO document_jobs("
-                "id, document_id, operation, state, attempts, next_attempt_at, error, "
-                "created_at, started_at, finished_at"
-                ") VALUES(?, ?, 'delete', 'queued', 0, ?, '', ?, NULL, NULL)",
-                (uuid4().hex, document_id, now, now),
-            )
+            enqueue_delete()
             return DocumentRecord(
                 current.id,
                 current.file_name,

@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import time
+import traceback
 from typing import Any, Protocol
 
 import httpx
@@ -37,8 +38,18 @@ class _Models(Protocol):
 
 
 def sanitize_error(exc: BaseException, limit: int = 500) -> str:
-    """Return bounded, single-line durable error text without document payloads."""
-    return " ".join(str(exc).split())[:limit] or exc.__class__.__name__
+    """Classify a failure without retaining arbitrary parser or model content."""
+    del limit
+    if isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+        return "operation timed out"
+    if isinstance(exc, httpx.ConnectError):
+        return "model connection failed"
+    if isinstance(exc, ModelHTTPError):
+        match = _HTTP_STATUS.search(str(exc))
+        return f"model service returned HTTP {match.group(1)}" if match else "model service failed"
+    if isinstance(exc, (DataValidationError, ValueError)):
+        return "document validation failed"
+    return "document processing failed"
 
 
 class DocumentWorker:
@@ -139,9 +150,7 @@ class DocumentWorker:
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
-            _LOG.exception(
-                "document job failed job_id=%s document_id=%s", job.id, job.document_id
-            )
+            self._log_failure("document job failed", job.document_id, exc, job.id)
             await self._fail_or_retry(job, exc)
         return True
 
@@ -262,8 +271,8 @@ class DocumentWorker:
         if published:
             try:
                 self._documents.source_path(job.document_id).unlink(missing_ok=True)
-            except OSError:
-                _LOG.exception("document source cleanup failed document_id=%s", job.document_id)
+            except OSError as exc:
+                self._log_failure("document source cleanup failed", job.document_id, exc)
 
     async def _embed_chunks(self, chunks: list[Chunk]) -> np.ndarray:
         if not chunks:
@@ -376,7 +385,11 @@ class DocumentWorker:
             document = conn.execute(
                 "SELECT status FROM documents WHERE id = ?", (job.document_id,)
             ).fetchone()
-            if document is not None and document[0] == "deleting":
+            if (
+                document is not None
+                and document[0] == "deleting"
+                and job.operation in {"ingest", "reindex"}
+            ):
                 conn.execute(
                     "UPDATE document_jobs SET state = 'cancelled', error = 'superseded by delete', "
                     "finished_at = ? WHERE id = ? AND state = 'running'", (now, job.id)
@@ -458,8 +471,31 @@ class DocumentWorker:
         )
         documents = [self._document_record(row) for row in rows[0]]
         chunks = [self._stored_chunk(row) for row in rows[1]]
-        vectors = self._vectors(chunks)
+        loop = asyncio.get_running_loop()
+        vectors = await loop.run_in_executor(
+            self._rag._cpu_executor,  # noqa: SLF001 - use RAG's bounded CPU executor
+            self._vectors,
+            chunks,
+        )
         return await self._rag.build(documents, chunks, vectors)
+
+    @staticmethod
+    def _log_failure(
+        message: str, document_id: str, exc: BaseException, job_id: str | None = None
+    ) -> None:
+        frames = traceback.extract_tb(exc.__traceback__)
+        locations = ",".join(
+            f"{frame.filename.rsplit('/', 1)[-1]}:{frame.lineno}:{frame.name}"
+            for frame in frames[-4:]
+        )
+        _LOG.error(
+            "%s job_id=%s document_id=%s error_type=%s frames=%s",
+            message,
+            job_id or "-",
+            document_id,
+            type(exc).__name__,
+            locations or "-",
+        )
 
     @staticmethod
     def _vectors(chunks: list[StoredChunk]) -> np.ndarray:

@@ -6,6 +6,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import threading
 import time
 
 import httpx
@@ -343,3 +344,71 @@ async def test_cancelled_stop_settles_worker_and_leaves_running_job_for_recovery
     await asyncio.sleep(0)
     assert tmp_runtime.worker._task is None  # noqa: SLF001 - lifecycle invariant
     assert await tmp_runtime.states() == ["running"]
+
+
+@pytest.mark.asyncio
+async def test_failed_delete_is_repaired_by_a_later_delete_request(
+    tmp_runtime: _Runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await tmp_runtime.documents.schedule_delete(tmp_runtime.document_id)
+
+    async def fail_build(*args: object) -> IndexSnapshot:
+        del args
+        raise ValueError("delete preparation failed")
+
+    monkeypatch.setattr(tmp_runtime.rag, "build", fail_build)
+    await tmp_runtime.worker.run_one()
+
+    assert sorted(await tmp_runtime.states()) == ["cancelled", "failed"]
+
+    monkeypatch.undo()
+    await tmp_runtime.documents.schedule_delete(tmp_runtime.document_id)
+    await tmp_runtime.documents.schedule_delete(tmp_runtime.document_id)
+    delete_jobs = await tmp_runtime.database.read(
+        lambda conn: conn.execute(
+            "SELECT count(*) FROM document_jobs WHERE document_id = ? "
+            "AND operation = 'delete' AND state IN ('queued', 'running')",
+            (tmp_runtime.document_id,),
+        ).fetchone()[0]
+    )
+    assert delete_jobs == 1
+    await tmp_runtime.worker.run_one()
+    assert await tmp_runtime.documents.get(tmp_runtime.document_id) is None
+
+
+@pytest.mark.asyncio
+async def test_candidate_vectors_are_prepared_in_the_cpu_executor(
+    tmp_runtime: _Runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    threads: list[int] = []
+    original = DocumentWorker._vectors
+
+    def track_vectors(chunks: list[object]) -> np.ndarray:
+        threads.append(threading.get_ident())
+        return original(chunks)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(DocumentWorker, "_vectors", staticmethod(track_vectors))
+    event_loop_thread = threading.get_ident()
+
+    await tmp_runtime.worker.run_one()
+
+    assert threads
+    assert set(threads).isdisjoint({event_loop_thread})
+
+
+@pytest.mark.asyncio
+async def test_arbitrary_error_text_is_not_persisted_or_logged(
+    tmp_runtime: _Runtime, caplog: pytest.LogCaptureFixture
+) -> None:
+    secret = "PROMPT-CHUNK-SECRET-DO-NOT-STORE"
+    tmp_runtime.parser.error = ValueError(secret)
+
+    await tmp_runtime.worker.run_one()
+
+    error = await tmp_runtime.database.read(
+        lambda conn: conn.execute(
+            "SELECT error FROM document_jobs WHERE id = 'ingest-job'"
+        ).fetchone()[0]
+    )
+    assert secret not in error
+    assert secret not in caplog.text
