@@ -271,8 +271,9 @@ body.document-sidebar-collapsed .document-sidebar {
     flex: 0 0 62px;
     display: flex;
     align-items: center;
-    justify-content: center;
+    justify-content: space-between;
     gap: 10px;
+    padding: 0 14px;
     border-bottom: 1px solid var(--border-color);
     background: var(--primary-color);
 }
@@ -281,7 +282,7 @@ body.document-sidebar-collapsed .document-sidebar {
     flex: 1;
     min-height: 0;
     overflow-y: auto;
-    padding: 0 0 104px;
+    padding: 0 0 92px;
     scrollbar-color: var(--scrollbar-color) transparent;
 }
 
@@ -314,17 +315,24 @@ body.document-sidebar-collapsed .document-sidebar {
     right: 0;
     bottom: 0;
     left: 0;
-    padding: 13px 20px 18px;
+    padding: 10px 12px 14px;
     background: linear-gradient(transparent, var(--primary-color) 22%);
 }
-.prompt-wrapper { width: min(100%, 800px); margin: 0 auto; }
-.prompt-form {
-    width: 100%;
-    min-height: 58px;
+.prompt-wrapper {
+    width: min(100%, 850px);
+    margin: 0 auto;
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 6px 7px 6px 18px;
+}
+.prompt-form {
+    min-width: 0;
+    flex: 1;
+    min-height: 52px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 5px 5px 14px;
     border: 1px solid var(--border-color);
     border-radius: 999px;
     background: var(--secondary-color);
@@ -369,7 +377,7 @@ body.bot-responding #send-prompt-btn { display: none; }
     body:not(.document-sidebar-collapsed) .document-sidebar { opacity: 1; visibility: visible; pointer-events: auto; }
     .top-bar { justify-content: space-between; padding: 0 14px; }
     .chats-container { padding: 22px 16px; gap: 16px; }
-    .prompt-container { padding: 12px 12px 14px; }
-    .prompt-form { min-height: 54px; padding-left: 15px; }
+    .prompt-container { padding: 9px 10px 12px; }
+    .prompt-form { min-height: 50px; padding-left: 13px; }
     .icon-button { width: 40px; height: 40px; flex-basis: 40px; }
 }

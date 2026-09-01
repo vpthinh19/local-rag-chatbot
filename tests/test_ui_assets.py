@@ -17,6 +17,8 @@ STYLE = ROOT / "src" / "static" / "style.css"
 
 
 class TemplateTree(HTMLParser):
+    VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
+
     def __init__(self) -> None:
         super().__init__()
         self.elements: dict[str, tuple[str, dict[str, str], tuple[str, ...]]] = {}
@@ -27,10 +29,12 @@ class TemplateTree(HTMLParser):
         identifier = values.get("id")
         if identifier:
             self.elements[identifier] = tag, values, tuple(self._parents)
-        self._parents.append(identifier or "")
+        if tag not in self.VOID_TAGS:
+            self._parents.append(identifier or "")
 
     def handle_endtag(self, tag: str) -> None:
-        del tag
+        if tag in self.VOID_TAGS:
+            return
         if self._parents:
             self._parents.pop()
 
@@ -80,19 +84,18 @@ def test_template_separates_upload_from_prompt_form() -> None:
     assert tree.has_button("stop-response-btn")
 
 
-def test_template_has_two_vertical_management_sidebars_and_three_top_controls() -> None:
+def test_template_has_two_vertical_management_sidebars_and_balanced_controls() -> None:
     tree = parse_template()
     assert tree.is_descendant("new-session-btn", "session-sidebar")
     assert tree.is_descendant("sessions-list", "session-sidebar")
     assert tree.is_descendant("upload-document-btn", "document-sidebar")
     assert tree.is_descendant("documents-list", "document-sidebar")
-    for identifier in (
-        "toggle-session-sidebar-btn",
-        "theme-toggle-btn",
-        "toggle-document-sidebar-btn",
-    ):
+    for identifier in ("toggle-session-sidebar-btn", "toggle-document-sidebar-btn"):
         assert tree.has_button(identifier)
         assert tree.is_descendant(identifier, "top-bar")
+    assert tree.has_button("theme-toggle-btn")
+    assert tree.is_descendant("theme-toggle-btn", "prompt-container")
+    assert not tree.is_descendant("theme-toggle-btn", "prompt-form")
 
 
 def test_file_picker_matches_backend_supported_extensions() -> None:
@@ -168,6 +171,9 @@ def test_controls_follow_round_and_pill_shape_rules() -> None:
     assert ".pill-button" in style and "border-radius: 999px" in style
     assert ".prompt-form" in style and "border-radius: 999px" in style
     assert "left: var(--sidebar-width)" not in style
+    assert "justify-content: space-between" in style
+    assert "min-height: 58px" not in style
+    assert "min-height: 52px" in style
 
 
 def test_browser_script_is_valid_javascript() -> None:

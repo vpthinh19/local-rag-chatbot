@@ -30,9 +30,6 @@
                 <button id="toggle-session-sidebar-btn" type="button" class="icon-button" title="Thu gọn khu vực cuộc trò chuyện" aria-label="Thu gọn khu vực cuộc trò chuyện" aria-expanded="true">
                     <span class="material-symbols-rounded">left_panel_close</span>
                 </button>
-                <button id="theme-toggle-btn" type="button" class="icon-button" title="Đổi giao diện" aria-label="Đổi giao diện">
-                    <span class="material-symbols-rounded">light_mode</span>
-                </button>
                 <button id="toggle-document-sidebar-btn" type="button" class="icon-button" title="Thu gọn khu vực tài liệu" aria-label="Thu gọn khu vực tài liệu" aria-expanded="true">
                     <span class="material-symbols-rounded">right_panel_close</span>
                 </button>
@@ -42,7 +39,7 @@
                 <div class="chats-container" aria-live="polite"></div>
             </div>
 
-            <div class="prompt-container">
+            <div class="prompt-container" id="prompt-container">
                 <div class="prompt-wrapper">
                     <form id="prompt-form" class="prompt-form">
                         <input type="text" placeholder="Nhập tin nhắn..." id="prompt-input" class="prompt-input" maxlength="12000" required />
@@ -55,6 +52,9 @@
                             </button>
                         </div>
                     </form>
+                    <button id="theme-toggle-btn" type="button" class="icon-button" title="Đổi giao diện" aria-label="Đổi giao diện">
+                        <span class="material-symbols-rounded">light_mode</span>
+                    </button>
                 </div>
             </div>
         </main>
