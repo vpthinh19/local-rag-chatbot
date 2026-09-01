@@ -79,10 +79,13 @@ class Database:
             try:
                 return await asyncio.shield(worker)
             except asyncio.CancelledError:
-                try:
-                    await asyncio.shield(worker)
-                except BaseException:
-                    pass
+                while not worker.done():
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        continue
+                    except BaseException:
+                        break
                 raise
 
     def _connect(self) -> sqlite3.Connection:
