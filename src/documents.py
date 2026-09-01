@@ -317,6 +317,11 @@ class DocumentService:
         """Register the durable worker's lightweight wake signal."""
         self._waker = waker
 
+    @property
+    def parser(self) -> ParserService:
+        """Expose the owned parser for application lifecycle settlement."""
+        return self._parser
+
     def _wake_worker(self) -> None:
         if self._waker is not None:
             self._waker()

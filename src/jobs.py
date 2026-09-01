@@ -88,6 +88,10 @@ class DocumentWorker:
         )
         self.wake()
 
+    async def build_ready_snapshot(self) -> Any:
+        """Reconstruct the ready persisted corpus before application readiness."""
+        return await self._candidate("", include_processing=False)
+
     def start(self) -> None:
         """Start the sole long-lived worker loop once."""
         if self._task is not None and not self._task.done():

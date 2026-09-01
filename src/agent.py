@@ -328,6 +328,15 @@ class AgentService:
         if active is not None:
             await self._request_and_cancel_sdk_run(session_id, active)
 
+    async def stop_and_settle(self, session_id: str) -> None:
+        """Cancel one session and wait until its SDK turn is no longer active."""
+        async with self._active_lock:
+            active = self._active.get(session_id)
+        if active is None:
+            return
+        await self._request_and_cancel_sdk_run(session_id, active)
+        await active.settled.wait()
+
     async def stop_all(self) -> None:
         """Request cancellation for every active stream without coupling sessions."""
         async with self._active_lock:
@@ -338,6 +347,15 @@ class AgentService:
                 for session_id, active in active_runs
             )
         )
+
+    async def stop_all_and_settle(self) -> None:
+        """Cancel all streams and await the settlement of that exact run snapshot."""
+        async with self._active_lock:
+            active_runs = tuple(self._active.items())
+        await asyncio.gather(
+            *(self._request_and_cancel_sdk_run(session_id, active) for session_id, active in active_runs)
+        )
+        await asyncio.gather(*(active.settled.wait() for _, active in active_runs))
 
     async def _request_sdk_cancellation(
         self, session_id: str, active: _ActiveRun

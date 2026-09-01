@@ -194,6 +194,16 @@ class SessionService:
             ]
         )
 
+    async def get(self, session_id: str) -> SessionRecord | None:
+        """Return one metadata record without exposing SDK-owned session rows."""
+        row = await self._database.read(
+            lambda conn: conn.execute(
+                "SELECT id, title, created_at, updated_at FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        )
+        return None if row is None else self._record(row)
+
     async def rename(self, session_id: str, title: str) -> SessionRecord:
         """Persist a user-selected title for one existing session."""
         if not isinstance(title, str) or not (title := title.strip()):
