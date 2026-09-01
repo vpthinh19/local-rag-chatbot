@@ -216,16 +216,20 @@ class AgentService:
                         ),
                     ),
                 )
-                active.stream = result
-                if active.cancellation_requested:
+                async with self._active_lock:
+                    active.stream = result
+                    cancellation_requested = active.cancellation_requested
+                if cancellation_requested:
                     result.cancel()
                 yield AgentEvent("start")
                 async for event in result.stream_events():
                     translated = self._translate(event)
                     if translated is not None:
                         yield translated
-                if not bool(getattr(result, "is_complete", False)):
-                    cancelled = True
+                async with self._active_lock:
+                    cancelled = active.cancellation_requested or not bool(
+                        getattr(result, "is_complete", False)
+                    )
                 failure = getattr(result, "run_loop_exception", None)
                 if failure is not None:
                     raise failure
@@ -235,17 +239,32 @@ class AgentService:
                 answer = getattr(result, "final_output", None)
                 if not isinstance(answer, str) or not answer.strip():
                     raise ValueError("agent returned an empty final answer")
-                await transaction.commit()
-                committed = True
+                async with self._active_lock:
+                    if active.cancellation_requested:
+                        cancelled = True
+                    else:
+                        await transaction.commit()
+                        committed = True
+                        if self._active.get(session_id) is active:
+                            del self._active[session_id]
+                if cancelled:
+                    yield AgentEvent("cancelled")
+                    return
                 yield AgentEvent("done")
         except asyncio.CancelledError:
             cancelled = True
-            if active.stream is not None:
-                active.stream.cancel()
+            async with self._active_lock:
+                active.cancellation_requested = True
+                stream = active.stream
+            if stream is not None:
+                stream.cancel()
             raise
         except Exception:
-            if active.stream is not None and not bool(getattr(active.stream, "is_complete", False)):
-                cancelled = True
+            async with self._active_lock:
+                cancelled = cancelled or active.cancellation_requested or (
+                    active.stream is not None
+                    and not bool(getattr(active.stream, "is_complete", False))
+                )
             yield AgentEvent("cancelled" if cancelled else "error")
         finally:
             if transaction is not None and not committed:
@@ -259,20 +278,23 @@ class AgentService:
         """Request safe cancellation of the exact active session stream, if any."""
         async with self._active_lock:
             active = self._active.get(session_id)
-        if active is not None and active.stream is not None:
-            active.stream.cancel()
-        elif active is not None:
-            active.cancellation_requested = True
+            if active is not None:
+                active.cancellation_requested = True
+                stream = active.stream
+            else:
+                stream = None
+        if stream is not None:
+            stream.cancel()
 
     async def stop_all(self) -> None:
         """Request cancellation for every active stream without coupling sessions."""
         async with self._active_lock:
             active_runs = tuple(self._active.values())
-        for active in active_runs:
-            if active.stream is not None:
-                active.stream.cancel()
-            else:
+            for active in active_runs:
                 active.cancellation_requested = True
+            streams = tuple(active.stream for active in active_runs if active.stream is not None)
+        for stream in streams:
+            stream.cancel()
 
     def _validate_message(self, message: object) -> str:
         if not isinstance(message, str) or not (clean := message.strip()):

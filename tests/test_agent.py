@@ -64,6 +64,8 @@ class _CompletedStream:
 
     def cancel(self) -> None:
         self.cancelled = True
+        # Match Agents SDK RunResultStreaming.cancel(mode="immediate") exactly.
+        self.is_complete = True
 
     async def stream_events(self):
         await self._session.add_items(
@@ -261,6 +263,45 @@ async def test_cancelled_sdk_stream_discards_the_turn(agent_harness, monkeypatch
     assert (await anext(stream)).type == "start"
     await agent_harness.service.stop("s1")
     assert [event.type async for event in stream] == ["cancelled"]
+    assert agent_harness.sessions.sdk_session("s1").items == []
+
+
+@pytest.mark.asyncio
+async def test_stop_all_discards_every_real_sdk_shaped_cancelled_turn(agent_harness, monkeypatch) -> None:
+    """Would fail if SDK cancellation's is_complete flag were mistaken for success."""
+    from src import agent
+
+    monkeypatch.setattr(
+        agent.Runner,
+        "run_streamed",
+        lambda *args, **kwargs: _CompletedStream(kwargs["session"]),
+    )
+    streams = [agent_harness.service.stream(f"s{index}", "question") for index in range(2)]
+    assert [await anext(stream) for stream in streams]
+    await agent_harness.service.stop_all()
+
+    assert [[event.type async for event in stream] for stream in streams] == [
+        ["cancelled"],
+        ["cancelled"],
+    ]
+    assert all(not agent_harness.sessions.sdk_session(f"s{index}").items for index in range(2))
+
+
+@pytest.mark.asyncio
+async def test_disconnect_discards_a_partially_streamed_turn(agent_harness, monkeypatch) -> None:
+    """Would fail if closing an SSE consumer committed its already-buffered SDK items."""
+    from src import agent
+
+    monkeypatch.setattr(
+        agent.Runner,
+        "run_streamed",
+        lambda *args, **kwargs: _CompletedStream(kwargs["session"]),
+    )
+    stream = agent_harness.service.stream("s1", "question")
+    assert (await anext(stream)).type == "start"
+    assert (await anext(stream)).type == "delta"
+    await stream.aclose()
+
     assert agent_harness.sessions.sdk_session("s1").items == []
 
 

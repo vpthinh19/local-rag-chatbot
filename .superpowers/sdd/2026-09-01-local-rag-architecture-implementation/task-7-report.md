@@ -25,3 +25,22 @@
 ## Concerns
 
 - `stop()` and `stop_all()` request cancellation without waiting for a caller-paused async generator to settle. The stream’s `finally` block discards the transaction and clears the active-run entry when consumption resumes; Task 8’s SSE/disconnect boundary must continue consuming/settling the exact stream before deleting a session.
+
+## Fix round 1 — SDK cancellation and live evaluation
+
+### RED
+
+- Updated the stream fake to match `RunResultStreaming.cancel()` by setting `is_complete=True`.
+- `uv run pytest tests/test_agent.py::test_cancelled_sdk_stream_discards_the_turn tests/test_agent.py::test_stop_all_discards_every_real_sdk_shaped_cancelled_turn tests/test_agent.py::test_stop_during_snapshot_capture_cancels_the_new_sdk_stream -q`: `3 failed`. Each stopped stream incorrectly emitted `done`, demonstrating that SDK completion state alone cannot represent application success.
+
+### GREEN
+
+- `uv run pytest tests/test_agent.py::test_cancelled_sdk_stream_discards_the_turn tests/test_agent.py::test_stop_all_discards_every_real_sdk_shaped_cancelled_turn tests/test_agent.py::test_stop_during_snapshot_capture_cancels_the_new_sdk_stream tests/test_agent.py::test_disconnect_discards_a_partially_streamed_turn -q`: `4 passed`.
+- `uv run pytest tests/test_agent.py tests/test_agent_eval.py -q`: `13 passed, 2 skipped`.
+- `uv run pytest -q`: `271 passed, 7 skipped`.
+
+### Changes and decisions
+
+- `src/agent.py` now records service-owned cancellation under the active-run lock before calling the SDK cancel method. Setup races, `stop_all`, SDK streams whose cancellation marks them complete, and the commit decision all consult that marker. A commit serializes against cancellation, so it either completes before a later stop observes no active run or a prior stop forces discard/cancelled.
+- `tests/test_agent.py` makes the fake mirror the pinned SDK cancellation behavior and covers stop-all plus a client consumer closing after a delta.
+- `tests/test_agent_eval.py` no longer imports `ChatAgent`, `LlamaClient`, or the custom two-completion loop. Its opt-in test builds the pinned Responses model, `LocalModelClients`, `RagService`, immutable snapshot, SQLite-backed `SessionService`, and `AgentService`; it observes persisted SDK function calls and final visible session messages through those real runtime boundaries.
