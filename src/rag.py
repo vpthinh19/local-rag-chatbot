@@ -559,26 +559,42 @@ class RagService:
         return [snapshot.chunks[index] for index in ranked[:result_limit]]
 
     async def _embed_batched(self, texts: list[str]) -> np.ndarray:
-        rows: list[list[float]] = []
+        batches: list[np.ndarray] = []
         dimension: int | None = None
         loop = asyncio.get_running_loop()
         for start in range(0, len(texts), self._batch_size):
             values = await self._models.embed(texts[start : start + self._batch_size])
-            matrix = await loop.run_in_executor(
+            matrix, dimension = await loop.run_in_executor(
                 self._cpu_executor,
                 partial(
-                    self._normalize_rows,
+                    self._prepare_query_batch,
                     values,
                     expected_rows=min(self._batch_size, len(texts) - start),
-                    label="query embedding",
+                    expected_dimension=dimension,
                 ),
             )
-            if dimension is None:
-                dimension = matrix.shape[1]
-            elif matrix.shape[1] != dimension:
-                raise ValueError("embedding dimension changed between batches")
-            rows.extend(matrix.tolist())
-        return np.asarray(rows, dtype=np.float32)
+            batches.append(matrix)
+        return await loop.run_in_executor(
+            self._cpu_executor, self._combine_query_batches, tuple(batches)
+        )
+
+    @staticmethod
+    def _prepare_query_batch(
+        values: object, *, expected_rows: int, expected_dimension: int | None
+    ) -> tuple[np.ndarray, int]:
+        """Normalize one model batch and validate it against prior batches."""
+        matrix = RagService._normalize_rows(
+            values, expected_rows=expected_rows, label="query embedding"
+        )
+        dimension = matrix.shape[1]
+        if expected_dimension is not None and dimension != expected_dimension:
+            raise ValueError("embedding dimension changed between batches")
+        return matrix, dimension
+
+    @staticmethod
+    def _combine_query_batches(batches: tuple[np.ndarray, ...]) -> np.ndarray:
+        """Join normalized query batches without vector work on the event loop."""
+        return np.concatenate(batches, axis=0).astype(np.float32, copy=False)
 
     def _rank_candidates(
         self,

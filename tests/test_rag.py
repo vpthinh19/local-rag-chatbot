@@ -371,6 +371,40 @@ async def test_search_normalizes_query_vectors_in_the_cpu_executor(
 
 
 @pytest.mark.asyncio
+async def test_search_validates_cross_batch_query_dimensions_in_the_cpu_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MixedDimensionModels(_FailingIfEmbeddedModels):
+        async def embed(self, texts: list[str]) -> list[list[float]]:
+            if len(texts) == 2:
+                return [[3.0, 4.0], [4.0, 3.0]]
+            return [[1.0, 0.0, 0.0]]
+
+    original_asarray = np.asarray
+    shape_threads: list[int] = []
+
+    class ThreadTrackedArray(np.ndarray):
+        @property
+        def shape(self) -> tuple[int, ...]:
+            shape_threads.append(threading.get_ident())
+            return super().shape
+
+    def track_asarray(*args: object, **kwargs: object) -> np.ndarray:
+        return original_asarray(*args, **kwargs).view(ThreadTrackedArray)
+
+    snapshot = _snapshot_with("document", "alpha fact", [1.0, 0.0])
+    monkeypatch.setattr("src.rag.np.asarray", track_asarray)
+    event_loop_thread = threading.get_ident()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        rag = RagService(MixedDimensionModels(), cpu_executor=executor, **LIMITS)
+        with pytest.raises(ValueError, match="dimension changed"):
+            await rag.search(snapshot, ["one", "two", "three"], [], 1)
+
+    assert shape_threads
+    assert set(shape_threads).isdisjoint({event_loop_thread})
+
+
+@pytest.mark.asyncio
 async def test_search_keeps_the_snapshot_it_started_with() -> None:
     old = _snapshot_with("old", "alpha fact", [1.0, 0.0])
     new = _snapshot_with("new", "beta fact", [0.0, 1.0])
