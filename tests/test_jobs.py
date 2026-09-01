@@ -244,7 +244,13 @@ async def test_ingest_persists_normalized_contiguous_float32_embeddings(
     assert vector.flags.c_contiguous
     assert vector.tolist() == pytest.approx([0.6, 0.8])
     assert await tmp_runtime.document_status() == "ready"
-    assert tmp_runtime.document_id in (await tmp_runtime.snapshots.capture()).document_ids
+    snapshot = await tmp_runtime.snapshots.capture()
+    assert tmp_runtime.document_id in snapshot.document_ids
+    assert next(
+        document.status
+        for document in snapshot.documents
+        if document.id == tmp_runtime.document_id
+    ) == "ready"
 
 
 @pytest.mark.asyncio

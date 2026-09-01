@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 import logging
 import re
@@ -478,6 +479,13 @@ class DocumentWorker:
             )
         )
         documents = [self._document_record(row) for row in rows[0]]
+        if include_processing:
+            documents = [
+                replace(document, status="ready")
+                if document.id == document_id
+                else document
+                for document in documents
+            ]
         chunks = [self._stored_chunk(row) for row in rows[1]]
         loop = asyncio.get_running_loop()
         vectors = await loop.run_in_executor(
