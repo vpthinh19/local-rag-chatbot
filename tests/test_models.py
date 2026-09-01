@@ -10,8 +10,12 @@ from src.models import (
     Corpus,
     DataValidationError,
     Document,
+    DocumentRecord,
     History,
+    JobRecord,
     Message,
+    SessionRecord,
+    StoredChunk,
 )
 
 
@@ -161,6 +165,44 @@ def test_settings_paths_follow_the_configured_data_root(tmp_path: Path) -> None:
     assert settings.staging_dir.is_dir()
     assert settings.corpus_path.parent.is_dir()
     assert settings.history_path.parent.is_dir()
+
+
+def test_settings_exposes_durable_storage_paths_and_global_limits(tmp_path: Path) -> None:
+    settings = Settings(data_dir=tmp_path / "isolated")
+
+    assert settings.database_path == tmp_path / "isolated" / "app.sqlite3"
+    assert settings.legacy_corpus_path == tmp_path / "isolated" / "corpus" / "corpus.json"
+    assert settings.legacy_history_path == tmp_path / "isolated" / "history" / "chat_history.json"
+    assert settings.agent_model == "local"
+    assert settings.agent_max_turns == 4
+    assert settings.session_raw_item_limit == 48
+    assert settings.session_visible_message_limit == 12
+    assert settings.session_context_chars == 12_000
+    assert settings.session_title_chars == 80
+    assert settings.job_max_attempts == 3
+    assert settings.job_retry_base_seconds == 1.0
+    assert settings.database_busy_timeout_ms == 5_000
+    assert (
+        settings.llm_concurrency,
+        settings.parser_concurrency,
+        settings.embedding_concurrency,
+        settings.rerank_concurrency,
+        settings.rag_cpu_workers,
+    ) == (4, 1, 1, 1, 2)
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        DocumentRecord("d", "file.pdf", "application/pdf", "ready", "", 0, "", 1.0, 2.0),
+        StoredChunk("d", 0, ("p. 1",), "text", None, None),
+        JobRecord("j", "d", "ingest", "queued", 0, 1.0, "", 1.0, None, None),
+        SessionRecord("s", "Title", 1.0, 2.0),
+    ],
+)
+def test_durable_records_are_immutable(record: object) -> None:
+    with pytest.raises((AttributeError, TypeError)):
+        setattr(record, "id", "changed")
 
 
 @pytest.mark.parametrize(

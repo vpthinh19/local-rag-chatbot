@@ -81,6 +81,24 @@ class Settings:
     max_parse_pages: int = 200
     tokenizer_name: str = "BAAI/bge-m3"
 
+    # Durable agent, session, and job limits.
+    agent_model: str = "local"
+    agent_max_turns: int = 4
+    session_raw_item_limit: int = 48
+    session_visible_message_limit: int = 12
+    session_context_chars: int = 12_000
+    session_title_chars: int = 80
+    job_max_attempts: int = 3
+    job_retry_base_seconds: float = 1.0
+    database_busy_timeout_ms: int = 5_000
+
+    # Per-resource gates match the measured local service capacities.
+    llm_concurrency: int = 4
+    parser_concurrency: int = 1
+    embedding_concurrency: int = 1
+    rerank_concurrency: int = 1
+    rag_cpu_workers: int = 2
+
     def __post_init__(self) -> None:
         """Normalize paths and reject nonpositive resource limits."""
         object.__setattr__(self, "data_dir", Path(self.data_dir))
@@ -100,6 +118,19 @@ class Settings:
             "parse_termination_grace_seconds": self.parse_termination_grace_seconds,
             "parse_timeout_seconds": self.parse_timeout_seconds,
             "max_parse_pages": self.max_parse_pages,
+            "agent_max_turns": self.agent_max_turns,
+            "session_raw_item_limit": self.session_raw_item_limit,
+            "session_visible_message_limit": self.session_visible_message_limit,
+            "session_context_chars": self.session_context_chars,
+            "session_title_chars": self.session_title_chars,
+            "job_max_attempts": self.job_max_attempts,
+            "job_retry_base_seconds": self.job_retry_base_seconds,
+            "database_busy_timeout_ms": self.database_busy_timeout_ms,
+            "llm_concurrency": self.llm_concurrency,
+            "parser_concurrency": self.parser_concurrency,
+            "embedding_concurrency": self.embedding_concurrency,
+            "rerank_concurrency": self.rerank_concurrency,
+            "rag_cpu_workers": self.rag_cpu_workers,
         }
         invalid = [name for name, value in numeric_limits.items() if value <= 0]
         if invalid:
@@ -116,22 +147,37 @@ class Settings:
         return self.data_dir / "staging"
 
     @property
-    def corpus_path(self) -> Path:
-        """Return the persisted corpus manifest path."""
+    def database_path(self) -> Path:
+        """Return the application-owned SQLite database path."""
+        return self.data_dir / "app.sqlite3"
+
+    @property
+    def legacy_corpus_path(self) -> Path:
+        """Return the temporary JSON corpus path used by migration."""
         return self.data_dir / "corpus" / "corpus.json"
 
     @property
-    def history_path(self) -> Path:
-        """Return the persisted chat history path."""
+    def legacy_history_path(self) -> Path:
+        """Return the temporary JSON history path used by migration."""
         return self.data_dir / "history" / "chat_history.json"
+
+    @property
+    def corpus_path(self) -> Path:
+        """Return the compatibility alias for the legacy corpus manifest."""
+        return self.legacy_corpus_path
+
+    @property
+    def history_path(self) -> Path:
+        """Return the compatibility alias for the legacy chat history."""
+        return self.legacy_history_path
 
     def ensure_dirs(self) -> None:
         """Create every application-owned data directory."""
         for path in (
             self.uploads_dir,
             self.staging_dir,
-            self.corpus_path.parent,
-            self.history_path.parent,
+            self.legacy_corpus_path.parent,
+            self.legacy_history_path.parent,
         ):
             path.mkdir(parents=True, exist_ok=True)
 

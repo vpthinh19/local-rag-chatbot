@@ -2,6 +2,7 @@
 
 from dataclasses import asdict, dataclass, field
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -10,6 +11,129 @@ from typing import Any, Literal, Mapping
 
 class DataValidationError(ValueError):
     """Persisted or external data does not match the public DTO contract."""
+
+
+DocumentStatus = Literal["processing", "ready", "failed", "deleting"]
+JobOperation = Literal["ingest", "reindex", "delete"]
+JobState = Literal["queued", "running", "succeeded", "failed", "cancelled"]
+
+
+def _timestamp(value: object, label: str) -> float:
+    """Validate a finite persisted timestamp."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise DataValidationError(f"{label} must be a finite number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise DataValidationError(f"{label} must be a finite number")
+    return result
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentRecord:
+    """Durable metadata for one uploaded document."""
+
+    id: str
+    file_name: str
+    media_type: str
+    status: DocumentStatus
+    overview: str
+    chunk_count: int
+    error: str
+    created_at: float
+    updated_at: float
+
+    def __post_init__(self) -> None:
+        """Validate values read from or written to the document table."""
+        _string(self.id, "document.id")
+        _string(self.file_name, "document.file_name")
+        _string(self.media_type, "document.media_type")
+        if self.status not in {"processing", "ready", "failed", "deleting"}:
+            raise DataValidationError("document.status is invalid")
+        _string(self.overview, "document.overview", allow_empty=True)
+        _integer(self.chunk_count, "document.chunk_count")
+        _string(self.error, "document.error", allow_empty=True)
+        _timestamp(self.created_at, "document.created_at")
+        _timestamp(self.updated_at, "document.updated_at")
+
+
+@dataclass(frozen=True, slots=True)
+class StoredChunk:
+    """One durable chunk and its optional persisted embedding."""
+
+    document_id: str
+    chunk_id: int
+    refs: tuple[str, ...]
+    text: str
+    embedding: bytes | None
+    embedding_dim: int | None
+
+    def __post_init__(self) -> None:
+        """Validate chunk storage values and detach source references."""
+        _string(self.document_id, "chunk.document_id")
+        _integer(self.chunk_id, "chunk.chunk_id")
+        if not isinstance(self.refs, tuple) or not all(
+            isinstance(ref, str) and ref.strip() for ref in self.refs
+        ):
+            raise DataValidationError("chunk.refs must contain nonempty strings")
+        _string(self.text, "chunk.text")
+        if self.embedding is not None and not isinstance(self.embedding, bytes):
+            raise DataValidationError("chunk.embedding must be bytes or None")
+        if self.embedding_dim is not None:
+            _integer(self.embedding_dim, "chunk.embedding_dim")
+            if self.embedding_dim == 0:
+                raise DataValidationError("chunk.embedding_dim must be positive")
+        if (self.embedding is None) != (self.embedding_dim is None):
+            raise DataValidationError("chunk.embedding and dimension must agree")
+
+
+@dataclass(frozen=True, slots=True)
+class JobRecord:
+    """Durable state for one document operation."""
+
+    id: str
+    document_id: str
+    operation: JobOperation
+    state: JobState
+    attempts: int
+    next_attempt_at: float
+    error: str
+    created_at: float
+    started_at: float | None
+    finished_at: float | None
+
+    def __post_init__(self) -> None:
+        """Validate values read from or written to the job table."""
+        _string(self.id, "job.id")
+        _string(self.document_id, "job.document_id")
+        if self.operation not in {"ingest", "reindex", "delete"}:
+            raise DataValidationError("job.operation is invalid")
+        if self.state not in {"queued", "running", "succeeded", "failed", "cancelled"}:
+            raise DataValidationError("job.state is invalid")
+        _integer(self.attempts, "job.attempts")
+        _timestamp(self.next_attempt_at, "job.next_attempt_at")
+        _string(self.error, "job.error", allow_empty=True)
+        _timestamp(self.created_at, "job.created_at")
+        if self.started_at is not None:
+            _timestamp(self.started_at, "job.started_at")
+        if self.finished_at is not None:
+            _timestamp(self.finished_at, "job.finished_at")
+
+
+@dataclass(frozen=True, slots=True)
+class SessionRecord:
+    """Durable metadata for one independent agent session."""
+
+    id: str
+    title: str
+    created_at: float
+    updated_at: float
+
+    def __post_init__(self) -> None:
+        """Validate values read from or written to the session table."""
+        _string(self.id, "session.id")
+        _string(self.title, "session.title")
+        _timestamp(self.created_at, "session.created_at")
+        _timestamp(self.updated_at, "session.updated_at")
 
 
 def _mapping(value: object, label: str) -> Mapping[str, Any]:
