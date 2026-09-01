@@ -10,26 +10,71 @@
 </head>
 <body>
     <div class="app-layout">
-        <aside class="sidebar" id="sidebar">
-            <div class="sidebar-header"><span class="material-symbols-rounded">folder_open</span><span>Tài liệu</span><button id="toggle-sidebar-btn" class="material-symbols-rounded" title="Thu gọn" aria-label="Thu gọn">chevron_left</button></div>
-            <form id="document-upload-form" class="document-upload-form">
+        <aside class="management-panel session-sidebar" id="session-sidebar" aria-label="Quản lý cuộc trò chuyện">
+            <div class="panel-header">
+                <span class="material-symbols-rounded panel-icon">forum</span>
+                <strong>Cuộc trò chuyện</strong>
+            </div>
+            <div class="panel-primary-action">
+                <button id="new-session-btn" type="button" class="pill-button">
+                    <span class="material-symbols-rounded">add_comment</span>
+                    <span>Cuộc trò chuyện mới</span>
+                </button>
+            </div>
+            <p id="session-status" class="panel-status" role="status" aria-live="polite"></p>
+            <ul id="sessions-list" class="sessions-list" aria-label="Danh sách cuộc trò chuyện"></ul>
+        </aside>
+
+        <main class="main-content">
+            <header class="top-bar" id="top-bar" aria-label="Điều khiển giao diện">
+                <button id="toggle-session-sidebar-btn" type="button" class="icon-button" title="Thu gọn khu vực cuộc trò chuyện" aria-label="Thu gọn khu vực cuộc trò chuyện" aria-expanded="true">
+                    <span class="material-symbols-rounded">left_panel_close</span>
+                </button>
+                <button id="theme-toggle-btn" type="button" class="icon-button" title="Đổi giao diện" aria-label="Đổi giao diện">
+                    <span class="material-symbols-rounded">light_mode</span>
+                </button>
+                <button id="toggle-document-sidebar-btn" type="button" class="icon-button" title="Thu gọn khu vực tài liệu" aria-label="Thu gọn khu vực tài liệu" aria-expanded="true">
+                    <span class="material-symbols-rounded">right_panel_close</span>
+                </button>
+            </header>
+
+            <div class="container">
+                <div class="chats-container" aria-live="polite"></div>
+            </div>
+
+            <div class="prompt-container">
+                <div class="prompt-wrapper">
+                    <form id="prompt-form" class="prompt-form">
+                        <input type="text" placeholder="Nhập tin nhắn..." id="prompt-input" class="prompt-input" maxlength="12000" required />
+                        <div class="prompt-actions">
+                            <button id="stop-response-btn" type="button" class="icon-button" title="Dừng xử lý" aria-label="Dừng xử lý">
+                                <span class="material-symbols-rounded">stop_circle</span>
+                            </button>
+                            <button id="send-prompt-btn" type="submit" class="icon-button primary-button" title="Gửi tin nhắn" aria-label="Gửi tin nhắn">
+                                <span class="material-symbols-rounded">arrow_upward</span>
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </main>
+
+        <aside class="management-panel document-sidebar" id="document-sidebar" aria-label="Quản lý tài liệu">
+            <div class="panel-header">
+                <span class="material-symbols-rounded panel-icon">folder_open</span>
+                <strong>Tài liệu</strong>
+            </div>
+            <form id="document-upload-form" class="panel-primary-action">
                 <label class="sr-only" for="document-file-input">Chọn tài liệu</label>
-                <input id="document-file-input" name="file" type="file" accept=".pdf,.doc,.docx,.docm,.odt,.rtf,.pages,.ppt,.pptx,.pptm,.odp,.key,.xls,.xlsx,.xlsm,.ods,.csv,.tsv,.numbers,.jpg,.jpeg,.png,.gif,.bmp,.tiff,.webp,.svg" required />
-                <button id="upload-document-btn" type="submit" class="material-symbols-rounded" title="Tải tài liệu lên" aria-label="Tải tài liệu lên">upload_file</button>
+                <input id="document-file-input" name="file" type="file" accept=".pdf,.doc,.docx,.docm,.odt,.rtf,.pages,.ppt,.pptx,.pptm,.odp,.key,.xls,.xlsx,.xlsm,.ods,.csv,.tsv,.numbers,.jpg,.jpeg,.png,.gif,.bmp,.tiff,.webp,.svg" hidden required />
+                <button id="upload-document-btn" type="button" class="pill-button">
+                    <span class="material-symbols-rounded">upload_file</span>
+                    <span>Tải tài liệu</span>
+                </button>
             </form>
+            <p id="document-status" class="panel-status" role="status" aria-live="polite"></p>
             <div class="documents-list" id="documents-list" aria-live="polite"></div>
         </aside>
-        <main class="main-content">
-            <header class="session-bar">
-                <button id="new-session-btn" type="button" class="material-symbols-rounded" title="Cuộc trò chuyện mới" aria-label="Cuộc trò chuyện mới">add_comment</button>
-                <ul id="sessions-list" class="sessions-list" aria-label="Cuộc trò chuyện"></ul>
-                <button id="rename-session-btn" type="button" class="material-symbols-rounded" title="Đổi tên cuộc trò chuyện" aria-label="Đổi tên cuộc trò chuyện">edit</button>
-                <button id="delete-session-btn" type="button" class="material-symbols-rounded" title="Xóa cuộc trò chuyện" aria-label="Xóa cuộc trò chuyện">delete</button>
-                <button id="theme-toggle-btn" type="button" class="material-symbols-rounded" title="Đổi giao diện" aria-label="Đổi giao diện">light_mode</button>
-            </header>
-            <div class="container"><div class="chats-container" aria-live="polite"></div></div>
-            <div class="prompt-container"><div class="prompt-wrapper"><form id="prompt-form" class="prompt-form"><input type="text" placeholder="Nhập tin nhắn..." id="prompt-input" class="prompt-input" maxlength="12000" required /><div class="prompt-actions"><button id="stop-response-btn" type="button" class="material-symbols-rounded" title="Dừng xử lý" aria-label="Dừng xử lý">stop_circle</button><button id="send-prompt-btn" class="material-symbols-rounded" title="Gửi tin nhắn" aria-label="Gửi tin nhắn">arrow_upward</button></div></form></div></div>
-        </main>
     </div>
     <script type="module" src="/static/script.js"></script>
 </body>

@@ -76,10 +76,23 @@ def test_template_separates_upload_from_prompt_form() -> None:
     assert tree.has_list("sessions-list")
     assert tree.has_input("document-file-input")
     assert not tree.is_descendant("document-file-input", "prompt-form")
-    assert tree.has_button("rename-session-btn")
-    assert tree.has_button("delete-session-btn")
     assert tree.has_button("upload-document-btn")
     assert tree.has_button("stop-response-btn")
+
+
+def test_template_has_two_vertical_management_sidebars_and_three_top_controls() -> None:
+    tree = parse_template()
+    assert tree.is_descendant("new-session-btn", "session-sidebar")
+    assert tree.is_descendant("sessions-list", "session-sidebar")
+    assert tree.is_descendant("upload-document-btn", "document-sidebar")
+    assert tree.is_descendant("documents-list", "document-sidebar")
+    for identifier in (
+        "toggle-session-sidebar-btn",
+        "theme-toggle-btn",
+        "toggle-document-sidebar-btn",
+    ):
+        assert tree.has_button(identifier)
+        assert tree.is_descendant(identifier, "top-bar")
 
 
 def test_file_picker_matches_backend_supported_extensions() -> None:
@@ -137,3 +150,25 @@ def test_script_uses_session_routes_and_independent_upload() -> None:
     assert 'message(role === "assistant" ? "bot" : role, content)' in script
     assert "function syncResponseState()" in script
     assert "document.body.classList.toggle(\"bot-responding\", streamControllers.has(selectedSessionId))" in script
+
+
+def test_ui_uses_inline_item_menus_without_native_dialogs() -> None:
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert "more_horiz" in script
+    assert "session-item-menu" in script
+    assert "document-item-menu" in script
+    assert "confirm(" not in script
+    assert "prompt(" not in script
+    assert "alert(" not in script
+
+
+def test_controls_follow_round_and_pill_shape_rules() -> None:
+    style = STYLE.read_text(encoding="utf-8")
+    assert ".icon-button" in style and "border-radius: 50%" in style
+    assert ".pill-button" in style and "border-radius: 999px" in style
+    assert ".prompt-form" in style and "border-radius: 999px" in style
+    assert "left: var(--sidebar-width)" not in style
+
+
+def test_browser_script_is_valid_javascript() -> None:
+    subprocess.run(["node", "--check", str(SCRIPT)], check=True, capture_output=True, text=True)
