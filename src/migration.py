@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import mimetypes
 import os
@@ -39,6 +40,16 @@ class _Session(Protocol):
     async def get_items(self, limit: int | None = None) -> list[Any]: ...
 
     async def add_items(self, items: list[Any]) -> None: ...
+
+
+async def _close_session(session: object) -> None:
+    """Release a one-shot migration SDK session when the implementation has close."""
+    close = getattr(session, "close", None)
+    if not callable(close):
+        return
+    result = close()
+    if inspect.isawaitable(result):
+        await result
 
 
 def _error(message: str) -> str:
@@ -314,24 +325,27 @@ async def _import_history(
         return 0, errors
 
     session = session_factory(_LEGACY_SESSION_ID)
-    existing = await session.get_items()
-    imported = 0
-    if not existing:
-        items = [{"role": message.role, "content": message.content} for message in messages]
-        await session.add_items(items)
-        imported = len(items)
+    try:
+        existing = await session.get_items()
+        imported = 0
+        if not existing:
+            items = [{"role": message.role, "content": message.content} for message in messages]
+            await session.add_items(items)
+            imported = len(items)
 
-    title = next(
-        (message.content for message in messages if message.role == "user"), messages[0].content
-    )[: settings.session_title_chars]
-    now = time.time()
-    await database.write(
-        lambda conn: conn.execute(
-            "INSERT INTO sessions(id, title, created_at, updated_at) VALUES(?, ?, ?, ?) "
-            "ON CONFLICT(id) DO NOTHING",
-            (_LEGACY_SESSION_ID, title, now, now),
+        title = next(
+            (message.content for message in messages if message.role == "user"), messages[0].content
+        )[: settings.session_title_chars]
+        now = time.time()
+        await database.write(
+            lambda conn: conn.execute(
+                "INSERT INTO sessions(id, title, created_at, updated_at) VALUES(?, ?, ?, ?) "
+                "ON CONFLICT(id) DO NOTHING",
+                (_LEGACY_SESSION_ID, title, now, now),
+            )
         )
-    )
+    finally:
+        await _close_session(session)
     return imported, errors
 
 

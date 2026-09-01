@@ -127,6 +127,10 @@ class DocumentWorker:
             try:
                 await asyncio.shield(task)
             except asyncio.CancelledError:
+                if task.done():
+                    # A worker/parser task cancelled by this shutdown has settled;
+                    # it is not evidence that the caller was cancelled.
+                    break
                 cancelled = True
                 continue
             except BaseException:

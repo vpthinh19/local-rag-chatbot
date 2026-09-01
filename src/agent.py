@@ -14,7 +14,7 @@ from pydantic import Field, StringConstraints
 
 from src.config import Settings
 from src.rag import IndexSnapshot, RagService, SnapshotStore
-from src.sessions import TransactionalSession, bounded_session_input
+from src.sessions import TransactionalSession, bounded_session_input, close_session
 
 
 _TOOL_RESULT_CHAR_LIMIT = 48_000
@@ -195,13 +195,15 @@ class AgentService:
             self._active[session_id] = active
 
         transaction: TransactionalSession | None = None
+        delegate: object | None = None
         event_iterator: AsyncIterator[object] | None = None
         cleanup_finished = False
         cancellation_deferred = False
         error_event = False
         try:
             snapshot = await self._snapshots.capture()
-            transaction = TransactionalSession(self._sessions.sdk_session(session_id))
+            delegate = self._sessions.sdk_session(session_id)
+            transaction = TransactionalSession(delegate)
             context = AgentContext(snapshot, self._rag)
             async with self._run_gate:
                 try:
@@ -316,6 +318,8 @@ class AgentService:
                     await self._finish_completed_shielded(session_id, active)
                     or cancellation_deferred
                 )
+            if delegate is not None:
+                await close_session(delegate)
         if cancellation_deferred:
             raise asyncio.CancelledError
         if error_event:

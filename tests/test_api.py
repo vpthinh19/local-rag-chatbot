@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 import asyncio
 import json
 from pathlib import Path
+import sys
 
 import httpx
 import pytest
@@ -128,3 +129,80 @@ async def test_document_upload_rejects_non_multipart_and_invalid_upload(tmp_path
     async with _client(tmp_path) as (_app, client):
         assert (await client.post("/api/documents", json={"file": "nope"})).status_code == 422
         assert (await client.post("/api/documents", files={"file": ("bad.txt", b"x", "text/plain")})).status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_lifespan_finishes_downstream_cleanup_after_worker_child_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Would fail if a cancelled worker child aborted parser/client/executor shutdown."""
+    app = create_app(_settings(tmp_path))
+    context = app.router.lifespan_context(app)
+    await context.__aenter__()
+    runtime = app.state.runtime
+    old_task = runtime.worker._task  # noqa: SLF001 - controlled lifecycle seam
+    assert old_task is not None
+    old_task.cancel()
+    await asyncio.gather(old_task, return_exceptions=True)
+    entered = asyncio.Event()
+    child_cancelled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def cancelled_child() -> None:
+        entered.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            child_cancelled.set()
+            await release.wait()
+            raise
+
+    child = asyncio.create_task(cancelled_child())
+    runtime.worker._task = child  # noqa: SLF001
+    original_drain = runtime.worker._drain  # noqa: SLF001 - controlled lifecycle seam
+    draining_child = asyncio.Event()
+
+    async def observe_drain(task: asyncio.Task[object]) -> bool:
+        if task is child:
+            draining_child.set()
+        return await original_drain(task)
+
+    monkeypatch.setattr(runtime.worker, "_drain", observe_drain)
+    parser_calls = 0
+    parser_started = asyncio.Event()
+    allow_parser_cleanup = asyncio.Event()
+    original_cancel = runtime.parser.cancel_active
+
+    async def count_parser_cleanup() -> None:
+        nonlocal parser_calls
+        parser_calls += 1
+        parser_started.set()
+        await allow_parser_cleanup.wait()
+        await original_cancel()
+
+    monkeypatch.setattr(runtime.parser, "cancel_active", count_parser_cleanup)
+    await entered.wait()
+    closing = asyncio.create_task(context.__aexit__(None, None, None))
+    await parser_started.wait()
+    await child_cancelled.wait()
+    allow_parser_cleanup.set()
+    await draining_child.wait()
+    release.set()
+    await closing
+
+    assert runtime.http.is_closed
+    assert runtime.executor._shutdown is True  # noqa: SLF001 - shutdown contract
+    assert parser_calls == 2
+
+
+def test_run_uses_one_worker_without_reload(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Would fail if the module launcher started multiple or reload workers."""
+    from src import main
+
+    called: dict[str, object] = {}
+    monkeypatch.setitem(sys.modules, "uvicorn", type("Uvicorn", (), {"run": staticmethod(lambda *args, **kwargs: called.update(args=args, kwargs=kwargs))})())
+
+    main.run()
+
+    assert called["args"] == ("src.main:app",)
+    assert called["kwargs"] == {"host": "127.0.0.1", "port": 8000, "workers": 1}

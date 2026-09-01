@@ -29,6 +29,7 @@ class _Models:
 class _Session:
     def __init__(self) -> None:
         self.items: list[Any] = []
+        self.close_calls = 0
 
     async def get_items(self, limit: int | None = None) -> list[Any]:
         return self.items if limit is None else self.items[-limit:]
@@ -41,6 +42,9 @@ class _Session:
 
     async def clear_session(self) -> None:
         self.items.clear()
+
+    def close(self) -> None:
+        self.close_calls += 1
 
 
 class _Sessions:
@@ -439,6 +443,7 @@ async def test_completed_sdk_stream_commits_only_after_nonempty_final_output(age
     assert observed[0].max_turns == 4
     assert observed[0].run_config.tracing_disabled is True
     assert observed[0].run_config.session_settings.limit == 48
+    assert agent_harness.sessions.sdk_session("s1").close_calls == 1
 
 
 @pytest.mark.asyncio

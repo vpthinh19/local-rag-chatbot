@@ -63,6 +63,20 @@ class MemorySession:
         self.items.clear()
 
 
+class ClosingSession(MemorySession):
+    """Session double that records the lifecycle close required by SQLiteSession."""
+
+    def __init__(self, items: list[dict[str, object]] = []) -> None:
+        super().__init__(items)
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+    async def get_items(self, limit: int | None = None) -> list[dict[str, object]]:
+        return await super().get_items(None if limit == -1 else limit)
+
+
 @pytest_asyncio.fixture
 async def session_service(tmp_path: Path) -> SessionService:
     settings = Settings(data_dir=tmp_path / "data")
@@ -250,3 +264,24 @@ async def test_rename_and_delete_clear_only_the_target_session(
     assert [record.id for record in await session_service.list()] == [second.id]
     with pytest.raises(DataValidationError, match="session does not exist"):
         await session_service.messages(first.id)
+
+
+@pytest.mark.asyncio
+async def test_messages_and_delete_close_each_sdk_session(
+    session_service: SessionService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Would fail if short-lived API SDK sessions retained SQLite connections."""
+    session = await session_service.create()
+    message_session = ClosingSession([user("question"), assistant("answer")])
+    delete_session = ClosingSession()
+    issued = iter([message_session, delete_session])
+    monkeypatch.setattr(session_service, "sdk_session", lambda _id: next(issued))
+
+    assert await session_service.messages(session.id) == [
+        Message("user", "question"), Message("assistant", "answer")
+    ]
+    await session_service.delete(session.id)
+
+    assert message_session.close_calls == 1
+    assert delete_session.items == []
+    assert delete_session.close_calls == 1

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import inspect
 import time
 from typing import Any, Mapping, Protocol
 from uuid import uuid4
@@ -32,6 +33,16 @@ class _Session(Protocol):
     async def pop_item(self) -> Any | None: ...
 
     async def clear_session(self) -> None: ...
+
+
+async def close_session(session: object) -> None:
+    """Close an SDK SQLite session while retaining narrow test-double support."""
+    close = getattr(session, "close", None)
+    if not callable(close):
+        return
+    result = close()
+    if inspect.isawaitable(result):
+        await result
 
 
 def _text(value: object) -> str | None:
@@ -231,7 +242,11 @@ class SessionService:
         await self._require(session_id)
         # A negative public SQLiteSession limit returns all items; the session's normal
         # default remains the 48-item bound used by agent runs.
-        items = await self.sdk_session(session_id).get_items(limit=-1)
+        session = self.sdk_session(session_id)
+        try:
+            items = await session.get_items(limit=-1)
+        finally:
+            await close_session(session)
         return [
             Message(role, text)
             for turn in _complete_turns(items)
@@ -243,7 +258,11 @@ class SessionService:
     async def delete(self, session_id: str) -> None:
         """Clear SDK-owned items before removing only this session's metadata."""
         await self._require(session_id)
-        await self.sdk_session(session_id).clear_session()
+        session = self.sdk_session(session_id)
+        try:
+            await session.clear_session()
+        finally:
+            await close_session(session)
         await self._database.write(
             lambda conn: conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
         )
