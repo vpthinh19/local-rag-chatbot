@@ -86,6 +86,51 @@ class _CompletedStream:
         )()
 
 
+class _BackgroundStream(_CompletedStream):
+    """A result whose SDK work outlives a disconnected event consumer."""
+
+    def __init__(self, session: TransactionalSession) -> None:
+        super().__init__(session)
+        self.cancel_calls = 0
+        self.background_started = asyncio.Event()
+        self.background_settled = asyncio.Event()
+        self._release_background = asyncio.Event()
+        self._background_task = asyncio.create_task(self._run_background())
+
+    async def _run_background(self) -> None:
+        await self._release_background.wait()
+        self.background_settled.set()
+
+    def cancel(self) -> None:
+        self.cancel_calls += 1
+        super().cancel()
+        self._release_background.set()
+
+    async def stream_events(self):
+        await self._session.add_items(
+            [
+                {"type": "message", "role": "user", "content": "question"},
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": self.final_output}],
+                },
+            ]
+        )
+        self.background_started.set()
+        yield type(
+            "Raw",
+            (),
+            {
+                "type": "raw_response_event",
+                "data": type(
+                    "Delta", (), {"type": "response.output_text.delta", "delta": self.final_output}
+                )(),
+            },
+        )()
+        await self.background_settled.wait()
+
+
 def _document(document_id: str, *, status: str = "ready", overview: str = "Tóm tắt") -> DocumentRecord:
     return DocumentRecord(document_id, f"{document_id}.pdf", "application/pdf", status, overview, 1, "", 1.0, 1.0)
 
@@ -289,20 +334,39 @@ async def test_stop_all_discards_every_real_sdk_shaped_cancelled_turn(agent_harn
 
 @pytest.mark.asyncio
 async def test_disconnect_discards_a_partially_streamed_turn(agent_harness, monkeypatch) -> None:
-    """Would fail if closing an SSE consumer committed its already-buffered SDK items."""
+    """Would fail if closing an SSE consumer left the SDK background run alive."""
     from src import agent
 
-    monkeypatch.setattr(
-        agent.Runner,
-        "run_streamed",
-        lambda *args, **kwargs: _CompletedStream(kwargs["session"]),
-    )
-    stream = agent_harness.service.stream("s1", "question")
-    assert (await anext(stream)).type == "start"
-    assert (await anext(stream)).type == "delta"
-    await stream.aclose()
+    agent_harness.service._run_gate = asyncio.Semaphore(1)
+    results: list[_BackgroundStream] = []
 
-    assert agent_harness.sessions.sdk_session("s1").items == []
+    def run_streamed(*args: Any, **kwargs: Any) -> _BackgroundStream:
+        result = _BackgroundStream(kwargs["session"])
+        results.append(result)
+        return result
+
+    monkeypatch.setattr(agent.Runner, "run_streamed", run_streamed)
+    stream = agent_harness.service.stream("s1", "question")
+    events = [await anext(stream), await anext(stream)]
+    try:
+        await results[0].background_started.wait()
+        await stream.aclose()
+
+        assert [event.type for event in events] == ["start", "delta"]
+        assert results[0].cancel_calls == 1
+        await asyncio.wait_for(results[0].background_settled.wait(), timeout=1)
+        assert not agent_harness.service._run_gate.locked()
+        assert agent_harness.sessions.sdk_session("s1").items == []
+
+        next_stream = agent_harness.service.stream("s2", "question")
+        assert (await asyncio.wait_for(anext(next_stream), timeout=1)).type == "start"
+        await next_stream.aclose()
+    finally:
+        for result in results:
+            result.cancel()
+        await asyncio.gather(
+            *(result._background_task for result in results), return_exceptions=True
+        )
 
 
 @pytest.mark.asyncio

@@ -44,3 +44,21 @@
 - `src/agent.py` now records service-owned cancellation under the active-run lock before calling the SDK cancel method. Setup races, `stop_all`, SDK streams whose cancellation marks them complete, and the commit decision all consult that marker. A commit serializes against cancellation, so it either completes before a later stop observes no active run or a prior stop forces discard/cancelled.
 - `tests/test_agent.py` makes the fake mirror the pinned SDK cancellation behavior and covers stop-all plus a client consumer closing after a delta.
 - `tests/test_agent_eval.py` no longer imports `ChatAgent`, `LlamaClient`, or the custom two-completion loop. Its opt-in test builds the pinned Responses model, `LocalModelClients`, `RagService`, immutable snapshot, SQLite-backed `SessionService`, and `AgentService`; it observes persisted SDK function calls and final visible session messages through those real runtime boundaries.
+
+## Fix round 2 — disconnected async-generator cleanup
+
+### RED
+
+- Replaced the disconnect double with a deterministic background-run fake that only settles after `cancel()` and uses a one-slot run gate.
+- `uv run pytest tests/test_agent.py::test_disconnect_discards_a_partially_streamed_turn -q`: `1 failed`; after `aclose()`, `cancel_calls` was `0`, proving generator closure bypassed the prior `asyncio.CancelledError` cleanup.
+
+### GREEN
+
+- `uv run pytest tests/test_agent.py::test_disconnect_discards_a_partially_streamed_turn tests/test_agent.py::test_cancelled_sdk_stream_discards_the_turn tests/test_agent.py::test_stop_all_discards_every_real_sdk_shaped_cancelled_turn tests/test_agent.py::test_stop_during_snapshot_capture_cancels_the_new_sdk_stream -q`: `4 passed`.
+- `uv run pytest tests/test_agent.py tests/test_agent_eval.py -q`: `13 passed, 2 skipped`.
+- `uv run pytest -q`: `271 passed, 7 skipped`.
+
+### Changes and decisions
+
+- Every uncommitted `AgentService.stream` exit now records service-owned cancellation and requests SDK cancellation from `finally`, including `aclose()`/disconnect closure. Completed, committed `done` runs skip this path.
+- A per-active-run SDK-cancel marker ensures concurrent stop, stop-all, setup completion, outer task cancellation, and generator closure issue at most one SDK cancellation request; the service marker is set before that request.

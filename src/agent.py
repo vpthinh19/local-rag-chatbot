@@ -154,6 +154,7 @@ class _ActiveRun:
     settled: asyncio.Event
     stream: Any | None = None
     cancellation_requested: bool = False
+    sdk_cancel_requested: bool = False
 
 
 class AgentService:
@@ -218,9 +219,15 @@ class AgentService:
                 )
                 async with self._active_lock:
                     active.stream = result
-                    cancellation_requested = active.cancellation_requested
-                if cancellation_requested:
-                    result.cancel()
+                    stream_to_cancel = (
+                        result
+                        if active.cancellation_requested and not active.sdk_cancel_requested
+                        else None
+                    )
+                    if stream_to_cancel is not None:
+                        active.sdk_cancel_requested = True
+                if stream_to_cancel is not None:
+                    stream_to_cancel.cancel()
                 yield AgentEvent("start")
                 async for event in result.stream_events():
                     translated = self._translate(event)
@@ -253,9 +260,7 @@ class AgentService:
                 yield AgentEvent("done")
         except asyncio.CancelledError:
             cancelled = True
-            async with self._active_lock:
-                active.cancellation_requested = True
-                stream = active.stream
+            stream = await self._request_sdk_cancellation(active)
             if stream is not None:
                 stream.cancel()
             raise
@@ -267,8 +272,12 @@ class AgentService:
                 )
             yield AgentEvent("cancelled" if cancelled else "error")
         finally:
-            if transaction is not None and not committed:
-                await transaction.discard()
+            if not committed:
+                stream = await self._request_sdk_cancellation(active)
+                if stream is not None:
+                    stream.cancel()
+                if transaction is not None:
+                    await transaction.discard()
             active.settled.set()
             async with self._active_lock:
                 if self._active.get(session_id) is active:
@@ -278,11 +287,7 @@ class AgentService:
         """Request safe cancellation of the exact active session stream, if any."""
         async with self._active_lock:
             active = self._active.get(session_id)
-            if active is not None:
-                active.cancellation_requested = True
-                stream = active.stream
-            else:
-                stream = None
+        stream = await self._request_sdk_cancellation(active) if active is not None else None
         if stream is not None:
             stream.cancel()
 
@@ -290,11 +295,21 @@ class AgentService:
         """Request cancellation for every active stream without coupling sessions."""
         async with self._active_lock:
             active_runs = tuple(self._active.values())
-            for active in active_runs:
-                active.cancellation_requested = True
-            streams = tuple(active.stream for active in active_runs if active.stream is not None)
+        streams = await asyncio.gather(
+            *(self._request_sdk_cancellation(active) for active in active_runs)
+        )
         for stream in streams:
-            stream.cancel()
+            if stream is not None:
+                stream.cancel()
+
+    async def _request_sdk_cancellation(self, active: _ActiveRun) -> Any | None:
+        """Record cancellation before requesting the matching SDK stream to stop."""
+        async with self._active_lock:
+            active.cancellation_requested = True
+            if active.stream is None or active.sdk_cancel_requested:
+                return None
+            active.sdk_cancel_requested = True
+            return active.stream
 
     def _validate_message(self, message: object) -> str:
         if not isinstance(message, str) or not (clean := message.strip()):
