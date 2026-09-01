@@ -87,48 +87,94 @@ class _CompletedStream:
 
 
 class _BackgroundStream(_CompletedStream):
-    """A result whose SDK work outlives a disconnected event consumer."""
+    """A result that settles only when its cancelled iterator is drained."""
 
     def __init__(self, session: TransactionalSession) -> None:
         super().__init__(session)
         self.cancel_calls = 0
         self.background_started = asyncio.Event()
-        self.background_settled = asyncio.Event()
-        self._release_background = asyncio.Event()
+        self.cancel_requested = asyncio.Event()
+        self.allow_settlement = asyncio.Event()
+        self.iterator_settled = asyncio.Event()
         self._background_task = asyncio.create_task(self._run_background())
 
     async def _run_background(self) -> None:
-        await self._release_background.wait()
-        self.background_settled.set()
+        await asyncio.Event().wait()
 
     def cancel(self) -> None:
         self.cancel_calls += 1
         super().cancel()
-        self._release_background.set()
+        self.cancel_requested.set()
+        self._background_task.cancel()
+
+    def stream_events(self) -> "_DrainOnlyEvents":
+        return _DrainOnlyEvents(self)
+
+
+class _DrainOnlyEvents:
+    """Models an SDK iterator whose cancellation finalizer runs only on a later next()."""
+
+    def __init__(self, result: _BackgroundStream) -> None:
+        self._result = result
+        self._first = True
+
+    def __aiter__(self) -> "_DrainOnlyEvents":
+        return self
+
+    async def __anext__(self) -> object:
+        if self._first:
+            self._first = False
+            await self._result._session.add_items(
+                [
+                    {"type": "message", "role": "user", "content": "question"},
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": self._result.final_output}],
+                    },
+                ]
+            )
+            self._result.background_started.set()
+            return type(
+                "Raw",
+                (),
+                {
+                    "type": "raw_response_event",
+                    "data": type(
+                        "Delta",
+                        (),
+                        {"type": "response.output_text.delta", "delta": self._result.final_output},
+                    )(),
+                },
+            )()
+        if self._result.cancelled:
+            await self._result.allow_settlement.wait()
+            await asyncio.gather(self._result._background_task, return_exceptions=True)
+            self._result.iterator_settled.set()
+            raise StopAsyncIteration
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+class _BarrierCompletedStream(_CompletedStream):
+    """A normally completed result whose final SDK event is test-controlled."""
+
+    def __init__(self, session: TransactionalSession) -> None:
+        super().__init__(session)
+        self.cancel_calls = 0
+        self.waiting_to_finish = asyncio.Event()
+        self.allow_finish = asyncio.Event()
+
+    def cancel(self) -> None:
+        self.cancel_calls += 1
+        super().cancel()
 
     async def stream_events(self):
-        await self._session.add_items(
-            [
-                {"type": "message", "role": "user", "content": "question"},
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": self.final_output}],
-                },
-            ]
-        )
-        self.background_started.set()
-        yield type(
-            "Raw",
-            (),
-            {
-                "type": "raw_response_event",
-                "data": type(
-                    "Delta", (), {"type": "response.output_text.delta", "delta": self.final_output}
-                )(),
-            },
-        )()
-        await self.background_settled.wait()
+        self.waiting_to_finish.set()
+        await self.allow_finish.wait()
+        self.is_complete = True
+        if False:
+            yield None
 
 
 def _document(document_id: str, *, status: str = "ready", overview: str = "Tóm tắt") -> DocumentRecord:
@@ -333,6 +379,44 @@ async def test_stop_all_discards_every_real_sdk_shaped_cancelled_turn(agent_harn
 
 
 @pytest.mark.asyncio
+async def test_stop_all_skips_a_stale_identity_that_committed_before_cancellation(agent_harness, monkeypatch) -> None:
+    """Would fail if a stop-all snapshot could cancel a run after its done event."""
+    from src import agent
+
+    results: list[_BarrierCompletedStream] = []
+
+    def run_streamed(*args: Any, **kwargs: Any) -> _BarrierCompletedStream:
+        result = _BarrierCompletedStream(kwargs["session"])
+        results.append(result)
+        return result
+
+    monkeypatch.setattr(agent.Runner, "run_streamed", run_streamed)
+    original_request = agent_harness.service._request_sdk_cancellation
+    cancellation_captured = asyncio.Event()
+    release_cancellation = asyncio.Event()
+
+    async def delayed_request(*args: Any) -> Any:
+        cancellation_captured.set()
+        await release_cancellation.wait()
+        return await original_request(*args)
+
+    monkeypatch.setattr(agent_harness.service, "_request_sdk_cancellation", delayed_request)
+    stream = agent_harness.service.stream("s1", "question")
+    assert (await anext(stream)).type == "start"
+    finishing = asyncio.create_task(anext(stream))
+    await results[0].waiting_to_finish.wait()
+    stopping = asyncio.create_task(agent_harness.service.stop_all())
+    await cancellation_captured.wait()
+
+    results[0].allow_finish.set()
+    assert (await finishing).type == "done"
+    release_cancellation.set()
+    await stopping
+
+    assert results[0].cancel_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_disconnect_discards_a_partially_streamed_turn(agent_harness, monkeypatch) -> None:
     """Would fail if closing an SSE consumer left the SDK background run alive."""
     from src import agent
@@ -350,20 +434,31 @@ async def test_disconnect_discards_a_partially_streamed_turn(agent_harness, monk
     events = [await anext(stream), await anext(stream)]
     try:
         await results[0].background_started.wait()
-        await stream.aclose()
+        closing = asyncio.create_task(stream.aclose())
+        await asyncio.wait_for(results[0].cancel_requested.wait(), timeout=1)
 
         assert [event.type for event in events] == ["start", "delta"]
         assert results[0].cancel_calls == 1
-        await asyncio.wait_for(results[0].background_settled.wait(), timeout=1)
+        assert not closing.done()
+        assert agent_harness.service._run_gate.locked()
+        assert "s1" in agent_harness.service._active
+
+        results[0].allow_settlement.set()
+        await asyncio.wait_for(closing, timeout=1)
+        assert results[0].iterator_settled.is_set()
+        assert results[0]._background_task.cancelled()
         assert not agent_harness.service._run_gate.locked()
+        assert "s1" not in agent_harness.service._active
         assert agent_harness.sessions.sdk_session("s1").items == []
 
         next_stream = agent_harness.service.stream("s2", "question")
         assert (await asyncio.wait_for(anext(next_stream), timeout=1)).type == "start"
+        results[1].allow_settlement.set()
         await next_stream.aclose()
     finally:
         for result in results:
             result.cancel()
+            result.allow_settlement.set()
         await asyncio.gather(
             *(result._background_task for result in results), return_exceptions=True
         )

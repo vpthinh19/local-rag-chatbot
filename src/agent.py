@@ -155,6 +155,7 @@ class _ActiveRun:
     stream: Any | None = None
     cancellation_requested: bool = False
     sdk_cancel_requested: bool = False
+    completed: bool = False
 
 
 class AgentService:
@@ -195,89 +196,96 @@ class AgentService:
         transaction: TransactionalSession | None = None
         committed = False
         cancelled = False
+        inner_cleanup_finished = False
+        event_iterator: AsyncIterator[object] | None = None
         try:
             snapshot = await self._snapshots.capture()
             transaction = TransactionalSession(self._sessions.sdk_session(session_id))
             context = AgentContext(snapshot, self._rag)
             async with self._run_gate:
-                result = Runner.run_streamed(
-                    self._agent,
-                    user_message,
-                    context=context,
-                    session=transaction,
-                    max_turns=self._settings.agent_max_turns,
-                    run_config=RunConfig(
-                        tracing_disabled=True,
-                        session_settings=SessionSettings(limit=self._settings.session_raw_item_limit),
-                        session_input_callback=lambda history, new: bounded_session_input(
-                            history,
-                            new,
-                            max_messages=self._settings.session_visible_message_limit,
-                            max_chars=self._settings.session_context_chars,
+                try:
+                    result = Runner.run_streamed(
+                        self._agent,
+                        user_message,
+                        context=context,
+                        session=transaction,
+                        max_turns=self._settings.agent_max_turns,
+                        run_config=RunConfig(
+                            tracing_disabled=True,
+                            session_settings=SessionSettings(limit=self._settings.session_raw_item_limit),
+                            session_input_callback=lambda history, new: bounded_session_input(
+                                history,
+                                new,
+                                max_messages=self._settings.session_visible_message_limit,
+                                max_chars=self._settings.session_context_chars,
+                            ),
                         ),
-                    ),
-                )
-                async with self._active_lock:
-                    active.stream = result
-                    stream_to_cancel = (
-                        result
-                        if active.cancellation_requested and not active.sdk_cancel_requested
-                        else None
                     )
+                    async with self._active_lock:
+                        active.stream = result
+                        stream_to_cancel = (
+                            result
+                            if active.cancellation_requested
+                            and not active.sdk_cancel_requested
+                            and not bool(getattr(result, "is_complete", False))
+                            else None
+                        )
+                        if stream_to_cancel is not None:
+                            active.sdk_cancel_requested = True
                     if stream_to_cancel is not None:
-                        active.sdk_cancel_requested = True
-                if stream_to_cancel is not None:
-                    stream_to_cancel.cancel()
-                yield AgentEvent("start")
-                async for event in result.stream_events():
-                    translated = self._translate(event)
-                    if translated is not None:
-                        yield translated
-                async with self._active_lock:
-                    cancelled = active.cancellation_requested or not bool(
-                        getattr(result, "is_complete", False)
-                    )
-                failure = getattr(result, "run_loop_exception", None)
-                if failure is not None:
-                    raise failure
-                if cancelled:
-                    yield AgentEvent("cancelled")
-                    return
-                answer = getattr(result, "final_output", None)
-                if not isinstance(answer, str) or not answer.strip():
-                    raise ValueError("agent returned an empty final answer")
-                async with self._active_lock:
-                    if active.cancellation_requested:
-                        cancelled = True
-                    else:
-                        await transaction.commit()
-                        committed = True
-                        if self._active.get(session_id) is active:
-                            del self._active[session_id]
-                if cancelled:
-                    yield AgentEvent("cancelled")
-                    return
-                yield AgentEvent("done")
+                        stream_to_cancel.cancel()
+                    event_iterator = result.stream_events()
+                    yield AgentEvent("start")
+                    async for event in event_iterator:
+                        translated = self._translate(event)
+                        if translated is not None:
+                            yield translated
+                    async with self._active_lock:
+                        cancelled = active.cancellation_requested or not bool(
+                            getattr(result, "is_complete", False)
+                        )
+                    failure = getattr(result, "run_loop_exception", None)
+                    if failure is not None:
+                        raise failure
+                    if cancelled:
+                        yield AgentEvent("cancelled")
+                        return
+                    answer = getattr(result, "final_output", None)
+                    if not isinstance(answer, str) or not answer.strip():
+                        raise ValueError("agent returned an empty final answer")
+                    async with self._active_lock:
+                        if active.cancellation_requested:
+                            cancelled = True
+                        else:
+                            await transaction.commit()
+                            committed = True
+                            active.completed = True
+                            if self._active.get(session_id) is active:
+                                del self._active[session_id]
+                    if cancelled:
+                        yield AgentEvent("cancelled")
+                        return
+                    yield AgentEvent("done")
+                except Exception:
+                    async with self._active_lock:
+                        cancelled = active.cancellation_requested
+                    raise
+                finally:
+                    if not committed:
+                        await self._cleanup_uncommitted(
+                            session_id, active, transaction, event_iterator
+                        )
+                        inner_cleanup_finished = True
         except asyncio.CancelledError:
             cancelled = True
-            stream = await self._request_sdk_cancellation(active)
-            if stream is not None:
-                stream.cancel()
             raise
         except Exception:
-            async with self._active_lock:
-                cancelled = cancelled or active.cancellation_requested or (
-                    active.stream is not None
-                    and not bool(getattr(active.stream, "is_complete", False))
-                )
             yield AgentEvent("cancelled" if cancelled else "error")
         finally:
-            if not committed:
-                stream = await self._request_sdk_cancellation(active)
-                if stream is not None:
-                    stream.cancel()
-                if transaction is not None:
-                    await transaction.discard()
+            if not committed and not inner_cleanup_finished:
+                await self._cleanup_uncommitted(
+                    session_id, active, transaction, event_iterator
+                )
             active.settled.set()
             async with self._active_lock:
                 if self._active.get(session_id) is active:
@@ -287,29 +295,70 @@ class AgentService:
         """Request safe cancellation of the exact active session stream, if any."""
         async with self._active_lock:
             active = self._active.get(session_id)
-        stream = await self._request_sdk_cancellation(active) if active is not None else None
+        stream = (
+            await self._request_sdk_cancellation(session_id, active)
+            if active is not None
+            else None
+        )
         if stream is not None:
             stream.cancel()
 
     async def stop_all(self) -> None:
         """Request cancellation for every active stream without coupling sessions."""
         async with self._active_lock:
-            active_runs = tuple(self._active.values())
+            active_runs = tuple(self._active.items())
         streams = await asyncio.gather(
-            *(self._request_sdk_cancellation(active) for active in active_runs)
+            *(
+                self._request_sdk_cancellation(session_id, active)
+                for session_id, active in active_runs
+            )
         )
         for stream in streams:
             if stream is not None:
                 stream.cancel()
 
-    async def _request_sdk_cancellation(self, active: _ActiveRun) -> Any | None:
+    async def _request_sdk_cancellation(
+        self, session_id: str, active: _ActiveRun
+    ) -> Any | None:
         """Record cancellation before requesting the matching SDK stream to stop."""
         async with self._active_lock:
+            if self._active.get(session_id) is not active or active.completed:
+                return None
             active.cancellation_requested = True
-            if active.stream is None or active.sdk_cancel_requested:
+            if (
+                active.stream is None
+                or active.sdk_cancel_requested
+                or bool(getattr(active.stream, "is_complete", False))
+            ):
                 return None
             active.sdk_cancel_requested = True
             return active.stream
+
+    async def _cleanup_uncommitted(
+        self,
+        session_id: str,
+        active: _ActiveRun,
+        transaction: TransactionalSession | None,
+        event_iterator: AsyncIterator[object] | None,
+    ) -> None:
+        """Cancel and drain one SDK run before releasing its application run slot."""
+        stream = await self._request_sdk_cancellation(session_id, active)
+        if stream is not None:
+            try:
+                stream.cancel()
+            except Exception:
+                pass
+        if event_iterator is not None:
+            try:
+                async for _ in event_iterator:
+                    pass
+            except (Exception, asyncio.CancelledError):
+                pass
+        if transaction is not None:
+            try:
+                await transaction.discard()
+            except (Exception, asyncio.CancelledError):
+                pass
 
     def _validate_message(self, message: object) -> str:
         if not isinstance(message, str) or not (clean := message.strip()):

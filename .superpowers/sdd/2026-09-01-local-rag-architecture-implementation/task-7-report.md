@@ -62,3 +62,22 @@
 
 - Every uncommitted `AgentService.stream` exit now records service-owned cancellation and requests SDK cancellation from `finally`, including `aclose()`/disconnect closure. Completed, committed `done` runs skip this path.
 - A per-active-run SDK-cancel marker ensures concurrent stop, stop-all, setup completion, outer task cancellation, and generator closure issue at most one SDK cancellation request; the service marker is set before that request.
+
+## Fix round 3 — SDK drain and stale stop-all identities
+
+### RED
+
+- Replaced the disconnect fake with a drain-only SDK-faithful iterator: `cancel()` cancels a background task, while iterator settlement occurs only on a later `__anext__` during draining. Added a barrier-controlled completion double for stop-all identity reuse.
+- `uv run pytest tests/test_agent.py::test_disconnect_discards_a_partially_streamed_turn tests/test_agent.py::test_stop_all_skips_a_stale_identity_that_committed_before_cancellation -q`: `2 failed`. `aclose()` returned before the iterator settled, and a delayed stale stop-all helper called `cancel()` after `done`.
+
+### GREEN
+
+- `uv run pytest tests/test_agent.py::test_disconnect_discards_a_partially_streamed_turn tests/test_agent.py::test_stop_all_skips_a_stale_identity_that_committed_before_cancellation -q`: `2 passed`.
+- `uv run pytest tests/test_agent.py tests/test_agent_eval.py -q`: `14 passed, 2 skipped`.
+- `uv run pytest -q`: `272 passed, 7 skipped`.
+
+### Changes and decisions
+
+- Uncommitted cleanup now occurs inside the `_run_gate` scope. It records cancellation, calls `cancel()` once when needed, drains the saved `stream_events()` iterator without emitting translated events, then discards the transactional session; only then can the semaphore and active-session entry be released. Cleanup exceptions are suppressed so they cannot mask the original stream exit.
+- Active runs now carry a completed marker. `stop`, `stop_all`, and cleanup cancellation requests verify the current `(session_id, active-object)` mapping under the lock; stale snapshot entries and already committed runs are not cancelled.
+- Capturing cancellation state before cleanup preserves `error` for a genuine empty-final-output validation failure rather than relabeling it as `cancelled`.
