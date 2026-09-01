@@ -183,6 +183,12 @@ class ParserService:
             raise DataValidationError("parser produced no chunks")
         chunks = [Chunk.from_dict(item) for item in raw_chunks]
         if any(
+            not chunk.refs
+            or any(not isinstance(reference, str) or not reference.strip() for reference in chunk.refs)
+            for chunk in chunks
+        ):
+            raise DataValidationError("parser chunks must include source references")
+        if any(
             chunk.file_id != document_id or chunk.file_name != file_name
             for chunk in chunks
         ):

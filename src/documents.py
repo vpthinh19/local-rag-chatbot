@@ -171,7 +171,8 @@ class DocumentService:
 
             return await database.write(insert)
         except BaseException:
-            committed_path.unlink(missing_ok=True)
+            if not await self._document_write_committed(database, document.id):
+                committed_path.unlink(missing_ok=True)
             raise
         finally:
             staged_path.unlink(missing_ok=True)
@@ -335,6 +336,21 @@ class DocumentService:
         if self._database is None:
             raise RuntimeError("durable document storage is not configured")
         return self._database
+
+    @staticmethod
+    async def _document_write_committed(database: Database, document_id: str) -> bool:
+        """Determine whether a write that raised after cancellation committed first."""
+        try:
+            return await database.read(
+                lambda conn: conn.execute(
+                    "SELECT 1 FROM documents WHERE id = ?", (document_id,)
+                ).fetchone()
+                is not None
+            )
+        except BaseException:
+            # An unknown outcome must retain the source for startup reconciliation;
+            # deleting it could corrupt a transaction that did commit.
+            return True
 
     async def _stream_to_staging(self, upload: Any) -> Path:
         """Copy an upload in fixed-size blocks without retaining its bytes in memory."""

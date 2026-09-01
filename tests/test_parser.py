@@ -28,6 +28,52 @@ def test_semantic_validation_accepts_eight_unicode_letters_or_digits() -> None:
     validate_parsed_chunks(chunks)
 
 
+def test_parser_output_rejects_chunks_without_source_references(tmp_path: Path) -> None:
+    output = tmp_path / "chunks.json"
+    output.write_text(
+        json.dumps(
+            {
+                "chunks": [
+                    {
+                        "file_id": "d",
+                        "file_name": "report.pdf",
+                        "chunk_id": 0,
+                        "refs": [],
+                        "text": "meaningful content",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DataValidationError, match="source references"):
+        ParserService._load_worker_chunks(output, "d", "report.pdf")
+
+
+def test_parser_output_rejects_blank_source_references(tmp_path: Path) -> None:
+    output = tmp_path / "chunks.json"
+    output.write_text(
+        json.dumps(
+            {
+                "chunks": [
+                    {
+                        "file_id": "d",
+                        "file_name": "report.pdf",
+                        "chunk_id": 0,
+                        "refs": [" "],
+                        "text": "meaningful content",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DataValidationError, match="chunk.refs"):
+        ParserService._load_worker_chunks(output, "d", "report.pdf")
+
+
 @pytest.mark.asyncio
 async def test_parser_stages_committed_source_under_its_validated_suffix(
     tmp_path: Path,

@@ -2,6 +2,7 @@ import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 import sys
+from threading import Event
 
 import pytest
 
@@ -512,6 +513,39 @@ async def test_upload_database_failure_removes_only_its_committed_file(
 
     assert list(settings.uploads_dir.iterdir()) == []
     assert list(settings.staging_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_upload_keeps_a_source_when_its_database_write_commits(
+    tmp_path: Path,
+) -> None:
+    settings, database, documents = await _durable_documents(tmp_path)
+    entered_write = Event()
+    release_write = Event()
+    original_write_sync = database._write_sync
+
+    def commit_after_cancellation(callback: object) -> object:
+        def delayed_callback(connection: object) -> object:
+            entered_write.set()
+            assert release_write.wait(timeout=2.0)
+            return callback(connection)  # type: ignore[operator]
+
+        return original_write_sync(delayed_callback)  # type: ignore[arg-type]
+
+    database._write_sync = commit_after_cancellation  # type: ignore[method-assign]
+    upload = UploadStub("report.pdf", b"content", "application/pdf")
+    task = asyncio.create_task(documents.create_upload(upload))
+    assert await asyncio.to_thread(entered_write.wait, 1.0)
+
+    task.cancel()
+    release_write.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    records = await documents.list()
+    assert len(records) == 1
+    assert documents.source_path(records[0].id).read_bytes() == b"content"
+    assert await _job_states(database, records[0].id) == [("ingest", "queued")]
 
 
 @pytest.mark.asyncio
