@@ -196,5 +196,12 @@ def test_controls_follow_round_and_pill_shape_rules() -> None:
     assert "min-height: 52px" in style
 
 
+def test_ui_uses_roboto_font_family() -> None:
+    style = STYLE.read_text(encoding="utf-8")
+    assert "family=Roboto:wght@400;500;700" in style
+    assert 'font-family: "Roboto", Arial, sans-serif' in style
+    assert "Poppins" not in style
+
+
 def test_browser_script_is_valid_javascript() -> None:
     subprocess.run(["node", "--check", str(SCRIPT)], check=True, capture_output=True, text=True)
