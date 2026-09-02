@@ -122,6 +122,31 @@ def test_production_splitter_uses_configured_bge_tokenizer(
     }
 
 
+def test_plain_text_is_chunked_without_liteparse_conversion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "notes.txt"
+    source.write_text("\ufeff# Ghi chú\nNội dung UTF-8", encoding="utf-8")
+
+    class Tokenizer:
+        @staticmethod
+        def encode(text: str, *, add_special_tokens: bool = False) -> SimpleNamespace:
+            del add_special_tokens
+            return SimpleNamespace(ids=text.split())
+
+    class Splitter:
+        @staticmethod
+        def chunk_indices(text: str) -> list[tuple[int, str]]:
+            return [(0, text)]
+
+    monkeypatch.setattr(worker, "_load_splitter", lambda _: (Tokenizer(), Splitter()))
+
+    chunks = worker.parse_file(source, "file", source.name, 200, "unused")
+
+    assert [chunk.text for chunk in chunks] == ["# Ghi chú\nNội dung UTF-8"]
+    assert chunks[0].refs == ["p. 1"]
+
+
 def test_cli_writes_validated_plain_chunks_atomically(tmp_path: Path) -> None:
     input_path = tmp_path / "input.pdf"
     output_path = tmp_path / "chunks.json"
@@ -190,7 +215,7 @@ def test_cli_failure_is_bounded_and_does_not_write_output(
     assert not output_path.exists()
 
 
-@pytest.mark.parametrize("file_name", ["../escape.pdf", "bad.txt", ""])
+@pytest.mark.parametrize("file_name", ["../escape.pdf", "bad.exe", ""])
 def test_cli_rejects_unsafe_or_unsupported_names(
     tmp_path: Path, file_name: str
 ) -> None:

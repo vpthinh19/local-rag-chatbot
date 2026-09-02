@@ -61,6 +61,10 @@ _MEDIA_TYPES: dict[str, frozenset[str]] = {
     ".tiff": frozenset({"image/tiff"}),
     ".webp": frozenset({"image/webp"}),
     ".svg": frozenset({"image/svg+xml"}),
+    ".txt": frozenset({"text/plain"}),
+    ".md": frozenset({"text/markdown", "text/plain", "text/x-markdown"}),
+    ".markdown": frozenset({"text/markdown", "text/plain", "text/x-markdown"}),
+    ".log": frozenset({"text/plain", "text/x-log"}),
 }
 
 

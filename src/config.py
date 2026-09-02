@@ -44,8 +44,9 @@ OFFICE_EXTENSIONS = frozenset(
 IMAGE_EXTENSIONS = frozenset(
     {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".tif", ".tiff", ".webp"}
 )
+TEXT_EXTENSIONS = frozenset({".log", ".markdown", ".md", ".txt"})
 SUPPORTED_DOCUMENT_EXTENSIONS = (
-    PDF_EXTENSIONS | OFFICE_EXTENSIONS | IMAGE_EXTENSIONS
+    PDF_EXTENSIONS | OFFICE_EXTENSIONS | IMAGE_EXTENSIONS | TEXT_EXTENSIONS
 )
 
 

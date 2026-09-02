@@ -149,7 +149,7 @@ async def test_document_upload_list_download_retry_and_durable_delete(tmp_path: 
 async def test_document_upload_rejects_non_multipart_and_invalid_upload(tmp_path: Path) -> None:
     async with _client(tmp_path) as (_app, client):
         assert (await client.post("/api/documents", json={"file": "nope"})).status_code == 422
-        assert (await client.post("/api/documents", files={"file": ("bad.txt", b"x", "text/plain")})).status_code == 400
+        assert (await client.post("/api/documents", files={"file": ("bad.exe", b"x", "application/octet-stream")})).status_code == 400
 
 
 @pytest.mark.asyncio

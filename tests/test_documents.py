@@ -55,6 +55,10 @@ async def test_upload_commits_a_processing_document_and_durable_job(tmp_path: Pa
         (".xlsb", "application/vnd.ms-excel.sheet.binary.macroenabled.12"),
         (".ots", "application/vnd.oasis.opendocument.spreadsheet-template"),
         (".tif", "image/tiff"),
+        (".txt", "text/plain"),
+        (".md", "text/markdown"),
+        (".markdown", "text/markdown"),
+        (".log", "text/plain"),
     ],
 )
 async def test_upload_accepts_current_liteparse_formats(
@@ -79,7 +83,7 @@ async def test_upload_rejects_untrusted_metadata_before_committing(tmp_path: Pat
     database = Database(settings.database_path, 2_000)
     await database.initialize()
     with pytest.raises(DataValidationError):
-        await DocumentService(settings, database).create_upload(Upload("bad.txt", b"x", "text/plain"))
+        await DocumentService(settings, database).create_upload(Upload("bad.exe", b"x", "application/octet-stream"))
 
 
 @pytest.mark.asyncio
