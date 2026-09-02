@@ -5,11 +5,11 @@ description = "Compact local RAG mini-agent"
 readme = "README.md"
 requires-python = "==3.12.*"
 dependencies = [
-    "bm25s>=0.3.9",
-    "fastapi[standard]>=0.139.0",
+    "bm25s>=0.3.11",
+    "fastapi[standard]>=0.141.1",
     "httpx>=0.28.1",
-    "liteparse>=2.5.1",
-    "numpy>=2.5.1",
+    "liteparse>=2.14.3",
+    "numpy>=2.5.2",
     "openai-agents==0.22.0",
     "semantic-text-splitter>=0.32.0",
     "tokenizers>=0.23.1",

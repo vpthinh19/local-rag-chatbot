@@ -7,7 +7,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-# LiteParse converts office files with LibreOffice and images with ImageMagick.
+# LiteParse converts office files with LibreOffice and handles images natively.
 PDF_EXTENSIONS = frozenset({".pdf"})
 OFFICE_EXTENSIONS = frozenset(
     {
@@ -15,24 +15,34 @@ OFFICE_EXTENSIONS = frozenset(
         ".doc",
         ".docm",
         ".docx",
+        ".dot",
+        ".dotm",
+        ".dotx",
         ".key",
         ".numbers",
         ".odp",
         ".ods",
         ".odt",
+        ".otp",
+        ".ots",
+        ".ott",
         ".pages",
+        ".pot",
+        ".potm",
+        ".potx",
         ".ppt",
         ".pptm",
         ".pptx",
         ".rtf",
         ".tsv",
         ".xls",
+        ".xlsb",
         ".xlsm",
         ".xlsx",
     }
 )
 IMAGE_EXTENSIONS = frozenset(
-    {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".tiff", ".webp"}
+    {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".tif", ".tiff", ".webp"}
 )
 SUPPORTED_DOCUMENT_EXTENSIONS = (
     PDF_EXTENSIONS | OFFICE_EXTENSIONS | IMAGE_EXTENSIONS

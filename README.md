@@ -8,6 +8,8 @@ của process nên nhiều worker không được hỗ trợ.
 
 Đặt các model GGUF theo `docker-compose.yaml`, rồi chạy:
 
+LibreOffice là dependency bắt buộc để LiteParse xử lý các định dạng Office.
+
 ```bash
 uv sync
 docker compose up -d

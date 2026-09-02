@@ -41,6 +41,39 @@ async def test_upload_commits_a_processing_document_and_durable_job(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("extension", "media_type"),
+    [
+        (".dot", "application/msword"),
+        (".dotm", "application/vnd.ms-word.template.macroenabled.12"),
+        (".dotx", "application/vnd.openxmlformats-officedocument.wordprocessingml.template"),
+        (".ott", "application/vnd.oasis.opendocument.text-template"),
+        (".pot", "application/vnd.ms-powerpoint"),
+        (".potm", "application/vnd.ms-powerpoint.template.macroenabled.12"),
+        (".potx", "application/vnd.openxmlformats-officedocument.presentationml.template"),
+        (".otp", "application/vnd.oasis.opendocument.presentation-template"),
+        (".xlsb", "application/vnd.ms-excel.sheet.binary.macroenabled.12"),
+        (".ots", "application/vnd.oasis.opendocument.spreadsheet-template"),
+        (".tif", "image/tiff"),
+    ],
+)
+async def test_upload_accepts_current_liteparse_formats(
+    tmp_path: Path, extension: str, media_type: str
+) -> None:
+    settings = Settings(data_dir=tmp_path / "data")
+    database = Database(settings.database_path, 2_000)
+    await database.initialize()
+
+    document = await DocumentService(settings, database).create_upload(
+        Upload(f"document{extension}", b"content", media_type)
+    )
+
+    assert document.file_name == f"document{extension}"
+    assert document.media_type == media_type
+    assert document.status == "processing"
+
+
+@pytest.mark.asyncio
 async def test_upload_rejects_untrusted_metadata_before_committing(tmp_path: Path) -> None:
     settings = Settings(data_dir=tmp_path / "data")
     database = Database(settings.database_path, 2_000)
