@@ -7,7 +7,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-# LiteParse converts office files with LibreOffice and images with ImageMagick.
+# LiteParse converts office files with LibreOffice and handles images natively.
 PDF_EXTENSIONS = frozenset({".pdf"})
 OFFICE_EXTENSIONS = frozenset(
     {
@@ -15,27 +15,38 @@ OFFICE_EXTENSIONS = frozenset(
         ".doc",
         ".docm",
         ".docx",
+        ".dot",
+        ".dotm",
+        ".dotx",
         ".key",
         ".numbers",
         ".odp",
         ".ods",
         ".odt",
+        ".otp",
+        ".ots",
+        ".ott",
         ".pages",
+        ".pot",
+        ".potm",
+        ".potx",
         ".ppt",
         ".pptm",
         ".pptx",
         ".rtf",
         ".tsv",
         ".xls",
+        ".xlsb",
         ".xlsm",
         ".xlsx",
     }
 )
 IMAGE_EXTENSIONS = frozenset(
-    {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".tiff", ".webp"}
+    {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".tif", ".tiff", ".webp"}
 )
+TEXT_EXTENSIONS = frozenset({".log", ".markdown", ".md", ".txt"})
 SUPPORTED_DOCUMENT_EXTENSIONS = (
-    PDF_EXTENSIONS | OFFICE_EXTENSIONS | IMAGE_EXTENSIONS
+    PDF_EXTENSIONS | OFFICE_EXTENSIONS | IMAGE_EXTENSIONS | TEXT_EXTENSIONS
 )
 
 
@@ -80,6 +91,27 @@ class Settings:
     parse_timeout_seconds: float = 300.0
     max_parse_pages: int = 200
     tokenizer_name: str = "BAAI/bge-m3"
+    embedding_signature: str = field(
+        default_factory=lambda: os.getenv("EMBEDDING_SIGNATURE", "BAAI/bge-m3")
+    )
+
+    # Durable agent, session, and job limits.
+    agent_model: str = "local"
+    agent_max_turns: int = 4
+    session_raw_item_limit: int = 48
+    session_visible_message_limit: int = 12
+    session_context_chars: int = 12_000
+    session_title_chars: int = 80
+    job_max_attempts: int = 3
+    job_retry_base_seconds: float = 1.0
+    database_busy_timeout_ms: int = 5_000
+
+    # Per-resource gates match the measured local service capacities.
+    llm_concurrency: int = 4
+    parser_concurrency: int = 1
+    embedding_concurrency: int = 1
+    rerank_concurrency: int = 1
+    rag_cpu_workers: int = 2
 
     def __post_init__(self) -> None:
         """Normalize paths and reject nonpositive resource limits."""
@@ -100,10 +132,25 @@ class Settings:
             "parse_termination_grace_seconds": self.parse_termination_grace_seconds,
             "parse_timeout_seconds": self.parse_timeout_seconds,
             "max_parse_pages": self.max_parse_pages,
+            "agent_max_turns": self.agent_max_turns,
+            "session_raw_item_limit": self.session_raw_item_limit,
+            "session_visible_message_limit": self.session_visible_message_limit,
+            "session_context_chars": self.session_context_chars,
+            "session_title_chars": self.session_title_chars,
+            "job_max_attempts": self.job_max_attempts,
+            "job_retry_base_seconds": self.job_retry_base_seconds,
+            "database_busy_timeout_ms": self.database_busy_timeout_ms,
+            "llm_concurrency": self.llm_concurrency,
+            "parser_concurrency": self.parser_concurrency,
+            "embedding_concurrency": self.embedding_concurrency,
+            "rerank_concurrency": self.rerank_concurrency,
+            "rag_cpu_workers": self.rag_cpu_workers,
         }
         invalid = [name for name, value in numeric_limits.items() if value <= 0]
         if invalid:
             raise ValueError(f"settings must be positive: {', '.join(invalid)}")
+        if not self.embedding_signature.strip():
+            raise ValueError("embedding_signature must be nonempty")
 
     @property
     def uploads_dir(self) -> Path:
@@ -116,13 +163,18 @@ class Settings:
         return self.data_dir / "staging"
 
     @property
-    def corpus_path(self) -> Path:
-        """Return the persisted corpus manifest path."""
+    def database_path(self) -> Path:
+        """Return the application-owned SQLite database path."""
+        return self.data_dir / "app.sqlite3"
+
+    @property
+    def legacy_corpus_path(self) -> Path:
+        """Return the read-only legacy corpus backup used by migration."""
         return self.data_dir / "corpus" / "corpus.json"
 
     @property
-    def history_path(self) -> Path:
-        """Return the persisted chat history path."""
+    def legacy_history_path(self) -> Path:
+        """Return the read-only legacy history backup used by migration."""
         return self.data_dir / "history" / "chat_history.json"
 
     def ensure_dirs(self) -> None:
@@ -130,8 +182,8 @@ class Settings:
         for path in (
             self.uploads_dir,
             self.staging_dir,
-            self.corpus_path.parent,
-            self.history_path.parent,
+            self.legacy_corpus_path.parent,
+            self.legacy_history_path.parent,
         ):
             path.mkdir(parents=True, exist_ok=True)
 

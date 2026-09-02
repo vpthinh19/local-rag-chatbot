@@ -12,7 +12,7 @@ import sys
 import tempfile
 from typing import Protocol
 
-from src.config import SUPPORTED_DOCUMENT_EXTENSIONS, settings
+from src.config import SUPPORTED_DOCUMENT_EXTENSIONS, TEXT_EXTENSIONS, settings
 from src.models import Chunk, DataValidationError
 
 
@@ -106,26 +106,29 @@ def parse_file(
     """Parse, chunk, and release all heavyweight worker-local objects."""
     parser = result = tokenizer = splitter = pages = None
     try:
-        from liteparse import LiteParse
+        if input_path.suffix.lower() in TEXT_EXTENSIONS:
+            pages = [PageMarkdown(1, input_path.read_text(encoding="utf-8-sig"))]
+        else:
+            from liteparse import LiteParse
 
-        parser = LiteParse(
-            ocr_enabled=True,
-            ocr_language="vie+eng",
-            max_pages=max_pages,
-            dpi=150,
-            output_format="markdown",
-            preserve_very_small_text=False,
-            image_mode="placeholder",
-            extract_links=True,
-        )
-        result = parser.parse(str(input_path))
-        pages = [
-            PageMarkdown(
-                page_num=int(page.page_num),
-                markdown=str(page.markdown or ""),
+            parser = LiteParse(
+                ocr_enabled=True,
+                ocr_language="vie+eng",
+                max_pages=max_pages,
+                dpi=150,
+                output_format="markdown",
+                preserve_very_small_text=False,
+                image_mode="placeholder",
+                extract_links=True,
             )
-            for page in result.pages
-        ]
+            result = parser.parse(str(input_path))
+            pages = [
+                PageMarkdown(
+                    page_num=int(page.page_num),
+                    markdown=str(page.markdown or ""),
+                )
+                for page in result.pages
+            ]
         tokenizer, splitter = _load_splitter(tokenizer_name)
 
         def count_tokens(

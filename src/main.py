@@ -1,74 +1,80 @@
-"""FastAPI entrypoint for the compact local RAG agent."""
+"""FastAPI composition root and thin session/document routes."""
+
+from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
-from typing import Any
-from uuid import uuid4
+from typing import AsyncIterator
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import httpx
+import numpy as np
+from pydantic import BaseModel
 
-from src.chat import ChatAgent, LiveHistory
+from src.agent import AgentEvent, AgentService
 from src.config import Settings, settings as default_settings
-from src.documents import DocumentService, LiveCorpus, RequestState
-from src.llama import LlamaClient
-from src.models import Corpus, History
-from src.rag import RagIndex
+from src.database import Database
+from src.documents import DocumentService
+from src.jobs import DocumentWorker
+from src.migration import migrate_legacy
+from src.model_clients import LocalModelClients, build_agent_model
+from src.models import DataValidationError, DocumentRecord, SessionRecord
+from src.rag import IndexSnapshot, RagService, SnapshotStore
+from src.sessions import SessionService
 
 
 @dataclass(slots=True)
 class ApplicationRuntime:
-    """Own live services and enforce the single-active-request rule."""
+    """The explicitly composed, application-owned runtime dependencies."""
 
     settings: Settings
     http: httpx.AsyncClient
-    live_corpus: LiveCorpus
-    live_history: LiveHistory
-    rag: RagIndex
+    database: Database
+    executor: ThreadPoolExecutor
+    models: LocalModelClients
+    rag: RagService
+    snapshots: SnapshotStore
     documents: DocumentService
-    chat: ChatAgent
-    # The lock protects slot ownership across chat, stop, and CRUD endpoints.
-    active: RequestState | None = None
-    active_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    parser: object
+    sessions: SessionService
+    worker: DocumentWorker
+    agent: AgentService
 
-    async def claim_request(self) -> RequestState | None:
-        """Claim the sole request slot, or return None when busy."""
-        async with self.active_lock:
-            if self.active is not None:
-                return None
-            state = RequestState(uuid4().hex)
-            self.active = state
-            return state
 
-    async def release_request(self, state: RequestState) -> None:
-        """Release the slot only when it still belongs to this request."""
-        async with self.active_lock:
-            if self.active is state:
-                self.active = None
+class _RenameRequest(BaseModel):
+    title: str
 
-    async def has_active_request(self) -> bool:
-        """Report whether chat or ingestion currently owns the slot."""
-        async with self.active_lock:
-            return self.active is not None
 
-    async def cancel_active(self) -> bool:
-        """Signal and await the active pipeline without cancelling the caller."""
-        async with self.active_lock:
-            state = self.active
-            if state is None:
-                return False
-            state.cancel_event.set()
-            task = state.task
-            if task is not None and not task.done():
-                task.cancel()
-        if task is not None and task is not asyncio.current_task():
-            await asyncio.gather(task, return_exceptions=True)
-        return True
+class _ChatRequest(BaseModel):
+    message: str
+
+
+def _record(record: DocumentRecord | SessionRecord) -> dict[str, object]:
+    return asdict(record)
+
+
+def _sse(value: dict[str, object]) -> str:
+    return f"data: {json.dumps(value, ensure_ascii=False, separators=(',', ':'))}\n\n"
+
+
+def _event_data(event: AgentEvent) -> dict[str, object]:
+    value: dict[str, object] = {"type": event.type}
+    if event.text:
+        value["text"] = event.text
+    return value
+
+
+def _http_error(exc: DataValidationError, *, conflict: bool = False) -> HTTPException:
+    detail = str(exc)
+    if detail.endswith("does not exist"):
+        return HTTPException(status_code=404, detail=detail)
+    return HTTPException(status_code=409 if conflict else 400, detail=detail)
 
 
 def create_app(
@@ -77,14 +83,13 @@ def create_app(
     model_transport: httpx.AsyncBaseTransport | None = None,
     heartbeat_interval: float = 10.0,
 ) -> FastAPI:
-    """Construct the web app around replaceable settings and model transport."""
+    """Build the application without embedding domain orchestration in routes."""
     configured = app_settings or default_settings
     static_dir = Path(__file__).parent / "static"
     template_path = Path(__file__).parent / "templates" / "index.html"
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        """Build live state at startup and close active work at shutdown."""
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         configured.ensure_dirs()
         timeout = httpx.Timeout(
             connect=configured.http_connect_timeout,
@@ -93,273 +98,217 @@ def create_app(
             pool=configured.http_pool_timeout,
         )
         http = httpx.AsyncClient(timeout=timeout, transport=model_transport)
+        executor = ThreadPoolExecutor(max_workers=configured.rag_cpu_workers)
         try:
-            llama = LlamaClient(
-                http,
-                configured.llm_url,
-                configured.embed_url,
-                configured.rerank_url,
-            )
-            rag = RagIndex(
-                llama,
-                batch_size=configured.embedding_batch_size,
-                lexical_limit=configured.lexical_candidate_limit,
-                semantic_limit=configured.semantic_candidate_limit,
-                candidate_limit=configured.fused_candidate_limit,
-                final_limit=configured.final_chunk_limit,
-            )
-            live_corpus = LiveCorpus(Corpus.load(configured.corpus_path))
-            live_history = LiveHistory(History.load(configured.history_path))
-            documents = DocumentService(configured, llama, live_corpus, rag)
-            live_corpus.value = documents.prune_missing_uploads(live_corpus.value)
-            await rag.rebuild(live_corpus.value)
-            chat = ChatAgent(
-                configured, llama, rag, live_corpus, live_history
-            )
-            runtime = ApplicationRuntime(
+            database = Database(configured.database_path, configured.database_busy_timeout_ms)
+            await database.initialize()
+            sessions = SessionService(configured, database)
+            await migrate_legacy(configured, database, sessions.sdk_session)
+            models = LocalModelClients(
                 configured,
                 http,
-                live_corpus,
-                live_history,
+                embedding_gate=asyncio.Semaphore(configured.embedding_concurrency),
+                rerank_gate=asyncio.Semaphore(configured.rerank_concurrency),
+            )
+            rag = RagService(
+                models,
+                cpu_executor=executor,
+                embedding_batch_size=configured.embedding_batch_size,
+                lexical_candidate_limit=configured.lexical_candidate_limit,
+                semantic_candidate_limit=configured.semantic_candidate_limit,
+                fused_candidate_limit=configured.fused_candidate_limit,
+                final_chunk_limit=configured.final_chunk_limit,
+            )
+            snapshots = SnapshotStore(
+                IndexSnapshot((), (), np.empty((0, 0), dtype=np.float32), None)
+            )
+            documents = DocumentService(configured, database, snapshots.publication_lock)
+            await documents.reconcile_files()
+            worker = DocumentWorker(
+                configured, database, documents, documents.parser, models, rag, snapshots
+            )
+            initial = await worker.build_ready_snapshot()
+            async with snapshots.publication_lock:
+                snapshots.install_locked(initial)
+            await worker.recover()
+            agent = AgentService(
+                configured,
+                snapshots,
                 rag,
-                documents,
-                chat,
+                sessions,
+                responses_model=build_agent_model(configured, http),
+            )
+            runtime = ApplicationRuntime(
+                configured, http, database, executor, models, rag, snapshots,
+                documents, documents.parser, sessions, worker, agent,
             )
             app.state.runtime = runtime
+            worker.start()
             yield
         finally:
             runtime = getattr(app.state, "runtime", None)
             if runtime is not None:
-                await runtime.cancel_active()
+                await runtime.agent.stop_all_and_settle()
+                await runtime.worker.stop()
+                await runtime.parser.cancel_active()
             await http.aclose()
+            executor.shutdown(wait=True, cancel_futures=True)
 
-    app = FastAPI(
-        title="Local RAG Chatbot",
-        version="3.0.0",
-        lifespan=lifespan,
-    )
+    app = FastAPI(title="Local RAG Chatbot", version="3.0.0", lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
     @app.get("/")
     async def index() -> FileResponse:
-        """Serve the single-page chat interface."""
         return FileResponse(template_path)
 
-    @app.post("/api/chat")
-    async def chat(
-        message: str = Form(...),
-        file: UploadFile | None = File(None),
-    ) -> StreamingResponse:
-        """Run optional ingestion and chat as one cancellable SSE request."""
-        runtime = _runtime(app)
-        clean_message = message.strip()
-        if not clean_message:
-            raise HTTPException(
-                status_code=400, detail="Chat message must not be empty"
-            )
-        if len(clean_message) > configured.max_message_chars:
-            raise HTTPException(status_code=413, detail="Chat message is too long")
-        request_state = await runtime.claim_request()
-        if request_state is None:
-            raise HTTPException(status_code=409, detail="Another chat request is active")
+    @app.post("/api/sessions", status_code=201)
+    async def create_session() -> JSONResponse:
+        return JSONResponse(_record(await _runtime(app).sessions.create()), status_code=201)
 
-        upload_name: str | None = None
-        upload_content: bytes | None = None
+    @app.get("/api/sessions")
+    async def list_sessions() -> JSONResponse:
+        return JSONResponse({"sessions": [_record(item) for item in await _runtime(app).sessions.list()]})
+
+    @app.patch("/api/sessions/{session_id}")
+    async def rename_session(session_id: str, body: _RenameRequest) -> JSONResponse:
         try:
-            if file is not None and file.filename:
-                upload_name = file.filename
-                upload_content = await file.read(configured.max_upload_bytes + 1)
-                await file.close()
-        except BaseException:
-            await runtime.release_request(request_state)
-            raise
+            session = await _runtime(app).sessions.rename(session_id, body.title)
+        except DataValidationError as exc:
+            raise _http_error(exc) from exc
+        return JSONResponse(_record(session))
 
-        queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+    @app.get("/api/sessions/{session_id}/messages")
+    async def session_messages(session_id: str) -> JSONResponse:
+        try:
+            messages = await _runtime(app).sessions.messages(session_id)
+        except DataValidationError as exc:
+            raise _http_error(exc) from exc
+        return JSONResponse({"messages": [asdict(item) for item in messages]})
 
-        async def pipeline() -> None:
-            """Produce status, answer, and terminal events for the SSE stream."""
+    @app.delete("/api/sessions/{session_id}", status_code=204)
+    async def delete_session(session_id: str) -> None:
+        runtime = _runtime(app)
+        if await runtime.sessions.get(session_id) is None:
+            raise HTTPException(status_code=404, detail="session does not exist")
+        await runtime.agent.stop_and_settle(session_id)
+        await runtime.sessions.delete(session_id)
+
+    @app.post("/api/sessions/{session_id}/chat")
+    async def chat(session_id: str, body: _ChatRequest, request: Request) -> StreamingResponse:
+        runtime = _runtime(app)
+        if await runtime.sessions.get(session_id) is None:
+            raise HTTPException(status_code=404, detail="session does not exist")
+        message = body.message.strip()
+        if not message:
+            raise HTTPException(status_code=400, detail="chat message must not be empty")
+        if len(message) > runtime.settings.max_message_chars:
+            raise HTTPException(status_code=413, detail="chat message exceeds the size limit")
+        stream = runtime.agent.stream(session_id, message)
+        try:
+            first = await anext(stream)
+        except ValueError as exc:
+            if "already active" in str(exc):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        await runtime.sessions.touch_from_first_message(session_id, message)
+
+        async def events() -> AsyncIterator[str]:
+            pending: asyncio.Task[AgentEvent] | None = None
             try:
-                if request_state.cancel_event.is_set():
-                    raise asyncio.CancelledError
-                new_document_id: str | None = None
-                if upload_name is not None and upload_content is not None:
-                    queue.put_nowait({"status": "Đang xử lý tài liệu..."})
-                    document = await runtime.documents.ingest(
-                        upload_name,
-                        upload_content,
-                        request_state,
-                    )
-                    new_document_id = document.file_id
-                    queue.put_nowait(
-                        {
-                            "status": (
-                                f"Đã xử lý {document.file_name} "
-                                f"({document.chunk_count} đoạn)"
-                            )
-                        }
-                    )
-                queue.put_nowait({"status": "Đang tạo câu trả lời..."})
-                async for content in runtime.chat.stream(
-                    clean_message, new_document_id=new_document_id
-                ):
-                    queue.put_nowait({"content": content})
-                queue.put_nowait({"done": True})
-            except asyncio.CancelledError:
-                queue.put_nowait({"cancelled": True})
-            except Exception as exc:
-                detail = " ".join(str(exc).split())[:500] or exc.__class__.__name__
-                queue.put_nowait({"error": detail})
-            finally:
-                request_state.task = None
-                await runtime.release_request(request_state)
-
-        async def events():
-            """Forward queued events and cancel work when the client disconnects."""
-            producer = asyncio.create_task(
-                pipeline(), name=f"chat-{request_state.request_id}"
-            )
-            request_state.task = producer
-            try:
-                yield _sse({"request_id": request_state.request_id})
-                terminal = False
-                while not terminal:
+                yield _sse(_event_data(first))
+                pending = asyncio.create_task(anext(stream))
+                while True:
+                    if await request.is_disconnected():
+                        return
                     try:
-                        event = await asyncio.wait_for(
-                            queue.get(), timeout=heartbeat_interval
-                        )
+                        event = await asyncio.wait_for(asyncio.shield(pending), heartbeat_interval)
                     except TimeoutError:
                         yield ": heartbeat\n\n"
                         continue
-                    terminal = any(
-                        event.get(key) is True
-                        for key in ("done", "cancelled")
-                    ) or "error" in event
-                    yield _sse(event)
-                await asyncio.gather(producer, return_exceptions=True)
+                    except StopAsyncIteration:
+                        return
+                    yield _sse(_event_data(event))
+                    pending = asyncio.create_task(anext(stream))
             finally:
-                async def cleanup() -> None:
-                    """Cancel and reap producer work before releasing its slot."""
-                    request_state.cancel_event.set()
-                    if not producer.done():
-                        producer.cancel()
-                    await asyncio.gather(producer, return_exceptions=True)
-                    request_state.task = None
-                    await runtime.release_request(request_state)
-
-                cleanup_task = asyncio.create_task(cleanup())
-                try:
-                    await asyncio.shield(cleanup_task)
-                except asyncio.CancelledError:
-                    await cleanup_task
-                    raise
+                if pending is not None and not pending.done():
+                    pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
+                await runtime.agent.stop_and_settle(session_id)
+                await stream.aclose()
 
         return StreamingResponse(
-            events(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache, no-store",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
-        )
-
-    @app.post("/api/stop")
-    async def stop() -> JSONResponse:
-        """Cancel the active chat or ingestion pipeline."""
-        cancelled = await _runtime(app).cancel_active()
-        return JSONResponse({"status": "ok", "cancelled": cancelled})
-
-    @app.get("/api/chat-history")
-    async def history() -> JSONResponse:
-        """Return persisted user-visible chat messages."""
-        return JSONResponse(
-            {"history": [item.to_dict() for item in _runtime(app).live_history.value.messages]}
-        )
-
-    @app.post("/api/clear-chat")
-    async def clear_chat() -> JSONResponse:
-        """Cancel active work and clear documents plus chat history."""
-        runtime = _runtime(app)
-        await runtime.cancel_active()
-        runtime.documents.clear()
-        empty_history = History()
-        empty_history.save(runtime.settings.history_path)
-        runtime.live_history.value = empty_history
-        return JSONResponse({"status": "ok"})
-
-    @app.get("/api/documents")
-    async def documents() -> JSONResponse:
-        """List committed document metadata."""
-        return JSONResponse(
-            {
-                "documents": [
-                    {
-                        "file_id": item.file_id,
-                        "file_name": item.file_name,
-                        "chunk_count": item.chunk_count,
-                    }
-                    for item in _runtime(app).live_corpus.value.documents
-                ]
+            events(), media_type="text/event-stream", headers={
+                "Cache-Control": "no-cache, no-store", "Connection": "keep-alive", "X-Accel-Buffering": "no",
             }
         )
 
-    @app.delete("/api/documents/{file_id}")
-    async def delete_document(file_id: str) -> JSONResponse:
-        """Delete one idle document transactionally."""
+    @app.post("/api/sessions/{session_id}/stop")
+    async def stop_session(session_id: str) -> JSONResponse:
         runtime = _runtime(app)
-        if await runtime.has_active_request():
-            raise HTTPException(status_code=409, detail="A chat request is active")
-        if not runtime.documents.delete(file_id):
-            raise HTTPException(status_code=404, detail="Document not found")
+        if await runtime.sessions.get(session_id) is None:
+            raise HTTPException(status_code=404, detail="session does not exist")
+        await runtime.agent.stop(session_id)
         return JSONResponse({"status": "ok"})
 
-    @app.get("/api/documents/{file_id}/download")
-    async def download_document(file_id: str) -> FileResponse:
-        """Download a committed document by canonical ID."""
-        runtime = _runtime(app)
-        document = next(
-            (
-                item
-                for item in runtime.live_corpus.value.documents
-                if item.file_id == file_id
-            ),
-            None,
-        )
+    @app.post("/api/documents", status_code=202)
+    async def upload_document(file: UploadFile = File(...)) -> JSONResponse:
+        try:
+            document = await _runtime(app).documents.create_upload(file)
+        except DataValidationError as exc:
+            raise _http_error(exc) from exc
+        finally:
+            await file.close()
+        return JSONResponse(_record(document), status_code=202)
+
+    @app.get("/api/documents")
+    async def list_documents() -> JSONResponse:
+        return JSONResponse({"documents": [_record(item) for item in await _runtime(app).documents.list()]})
+
+    @app.get("/api/documents/{document_id}/download")
+    async def download_document(document_id: str) -> FileResponse:
+        documents = _runtime(app).documents
+        document = await documents.get(document_id)
         if document is None:
-            raise HTTPException(status_code=404, detail="Document not found")
-        path = runtime.settings.uploads_dir / f"{document.file_id}_{document.file_name}"
-        if not path.is_file():
-            raise HTTPException(status_code=404, detail="File not found")
-        return FileResponse(
-            path,
-            filename=document.file_name,
-            media_type="application/octet-stream",
-        )
+            raise HTTPException(status_code=404, detail="document does not exist")
+        try:
+            path = await documents.download_path(document_id)
+        except DataValidationError as exc:
+            raise _http_error(exc, conflict=document.status == "deleting") from exc
+        return FileResponse(path, filename=document.file_name, media_type=document.media_type)
+
+    @app.post("/api/documents/{document_id}/retry", status_code=202)
+    async def retry_document(document_id: str) -> JSONResponse:
+        try:
+            document = await _runtime(app).documents.retry(document_id)
+        except DataValidationError as exc:
+            raise _http_error(exc, conflict=True) from exc
+        return JSONResponse(_record(document), status_code=202)
+
+    @app.delete("/api/documents/{document_id}", status_code=202)
+    async def delete_document(document_id: str) -> JSONResponse:
+        try:
+            document = await _runtime(app).documents.schedule_delete(document_id)
+        except DataValidationError as exc:
+            raise _http_error(exc) from exc
+        return JSONResponse(_record(document), status_code=202)
 
     return app
 
 
 def _runtime(app: FastAPI) -> ApplicationRuntime:
-    """Return initialized runtime state or an HTTP readiness error."""
     runtime: ApplicationRuntime | None = getattr(app.state, "runtime", None)
     if runtime is None:
         raise HTTPException(status_code=503, detail="Application is not ready")
     return runtime
 
 
-def _sse(event: dict[str, object]) -> str:
-    """Encode one JSON value as a server-sent event."""
-    return f"data: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\n\n"
-
-
 app = create_app()
 
 
 def run() -> None:
-    """Run the local single-worker ASGI server."""
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=8000, workers=1)
+    uvicorn.run("src.main:app", host="127.0.0.1", port=8000, workers=1)
 
 
 if __name__ == "__main__":
