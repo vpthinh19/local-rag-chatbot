@@ -1,4 +1,5 @@
 import { documentActions, reduceStreamEvent, shouldPollDocuments } from "./state.mjs";
+import { renderMarkdown } from "./markdown.mjs";
 
 const $ = (selector) => document.querySelector(selector);
 const chatsContainer = $(".chats-container");
@@ -55,9 +56,10 @@ const scrollToBottom = () => {
 const message = (role, content, extra = "") => {
   const row = document.createElement("div");
   row.className = `message ${role}-message ${extra}`;
-  const text = document.createElement("p");
+  const text = document.createElement("div");
   text.className = "message-text";
-  text.textContent = content;
+  if (role === "bot") text.innerHTML = renderMarkdown(content);
+  else text.textContent = content;
   row.append(text);
   return row;
 };

@@ -297,15 +297,31 @@ body.document-sidebar-collapsed .document-sidebar {
 }
 
 .message { display: flex; min-width: 0; }
-.message-text { line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
+.message-text { line-height: 1.65; overflow-wrap: anywhere; }
 .bot-message { justify-content: flex-start; }
 .bot-message .message-text { width: 100%; }
+.bot-message .message-text > :first-child { margin-top: 0; }
+.bot-message .message-text > :last-child { margin-bottom: 0; }
+.bot-message .message-text p, .bot-message .message-text ul, .bot-message .message-text ol,
+.bot-message .message-text pre, .bot-message .message-text blockquote { margin: 0 0 12px; }
+.bot-message .message-text h1, .bot-message .message-text h2, .bot-message .message-text h3,
+.bot-message .message-text h4, .bot-message .message-text h5, .bot-message .message-text h6 { margin: 18px 0 8px; line-height: 1.3; }
+.bot-message .message-text ul, .bot-message .message-text ol { padding-left: 24px; }
+.bot-message .message-text code { padding: 2px 6px; border-radius: 6px; background: var(--secondary-color); }
+.bot-message .message-text pre { overflow-x: auto; padding: 14px; border-radius: 14px; background: var(--secondary-color); }
+.bot-message .message-text pre code { padding: 0; background: transparent; }
+.bot-message .message-text blockquote { padding-left: 14px; border-left: 3px solid var(--accent-color); color: var(--subheading-color); }
+.bot-message .message-text a { color: var(--accent-color); }
+.table-scroll { overflow-x: auto; margin-bottom: 12px; }
+.bot-message table { width: 100%; border-collapse: collapse; }
+.bot-message th, .bot-message td { padding: 8px 10px; border: 1px solid var(--border-color); text-align: left; }
 .user-message { justify-content: flex-end; }
 .user-message .message-text {
     max-width: 78%;
     padding: 11px 16px;
     border-radius: 20px 20px 5px 20px;
     background: var(--secondary-color);
+    white-space: pre-wrap;
 }
 .message.loading .status-text { color: var(--subheading-color); font-style: italic; font-size: .88rem; }
 

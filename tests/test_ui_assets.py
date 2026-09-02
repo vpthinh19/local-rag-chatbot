@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "src" / "templates" / "index.html"
 SCRIPT = ROOT / "src" / "static" / "script.js"
 STATE = ROOT / "src" / "static" / "state.mjs"
+MARKDOWN = ROOT / "src" / "static" / "markdown.mjs"
 STYLE = ROOT / "src" / "static" / "style.css"
 
 
@@ -153,6 +154,25 @@ def test_script_uses_session_routes_and_independent_upload() -> None:
     assert 'message(role === "assistant" ? "bot" : role, content)' in script
     assert "function syncResponseState()" in script
     assert "document.body.classList.toggle(\"bot-responding\", streamControllers.has(selectedSessionId))" in script
+
+
+def test_bot_markdown_renderer_formats_content_without_trusting_html() -> None:
+    source = "# Tiêu đề\n\n- một\n- hai\n\n**đậm** và `code`\n\n<script>alert(1)</script>"
+    program = (
+        f"import {{ renderMarkdown }} from {json.dumps(MARKDOWN.as_uri())};"
+        f"console.log(JSON.stringify(renderMarkdown({json.dumps(source)})));"
+    )
+    result = subprocess.run(
+        ["node", "--input-type=module", "-e", program],
+        check=True, capture_output=True, text=True,
+    )
+    rendered = json.loads(result.stdout)
+    assert "<h1>Tiêu đề</h1>" in rendered
+    assert "<ul><li>một</li><li>hai</li></ul>" in rendered
+    assert "<strong>đậm</strong>" in rendered
+    assert "<code>code</code>" in rendered
+    assert "<script>" not in rendered
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in rendered
 
 
 def test_ui_uses_inline_item_menus_without_native_dialogs() -> None:
