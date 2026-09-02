@@ -8,41 +8,54 @@
 }
 
 :root {
-    --text-color: #edf3ff;
-    --subheading-color: #97a7ca;
-    --placeholder-color: #c3cdde;
-    --primary-color: #101623;
-    --secondary-color: #283045;
-    --secondary-hover-color: #333e58;
-    --panel-color: #1a2233;
-    --border-color: #333e58;
-    --scrollbar-color: #626a7f;
-    --accent-color: #1d7efd;
-    --danger-color: #f05a67;
+    color-scheme: dark;
+    --text-color: #f1f4fa;
+    --subheading-color: #a9b0bf;
+    --placeholder-color: #a9b0bf;
+    --primary-color: #111318;
+    --secondary-color: #242832;
+    --secondary-hover-color: #2d3240;
+    --panel-color: #1b1e25;
+    --border-color: #353a47;
+    --scrollbar-color: #626a7a;
+    --accent-color: #4f8cff;
+    --accent-hover-color: #6e9fff;
+    --danger-color: #ff7d88;
+    --success-color: #52d6a3;
     --session-panel-width: 286px;
     --document-panel-width: 310px;
 }
 
 body.light-theme {
-    --text-color: #090c13;
-    --subheading-color: #687692;
-    --placeholder-color: #606982;
-    --primary-color: #f3f7ff;
-    --secondary-color: #dce6f9;
-    --secondary-hover-color: #d2ddf2;
-    --panel-color: #e8effc;
-    --border-color: #cbd7eb;
-    --scrollbar-color: #a2aac2;
+    color-scheme: light;
+    --text-color: #1b1e26;
+    --subheading-color: #667084;
+    --placeholder-color: #667084;
+    --primary-color: #f7f8fb;
+    --secondary-color: #f0f3f8;
+    --secondary-hover-color: #e6ebf3;
+    --panel-color: #ffffff;
+    --border-color: #dce1ea;
+    --scrollbar-color: #a4acba;
+    --accent-color: #1769e0;
+    --accent-hover-color: #0f5ecf;
+    --danger-color: #c52e3b;
+    --success-color: #15845d;
 }
 
 body {
     color: var(--text-color);
-    background: var(--primary-color);
+    background: radial-gradient(circle at 50% -20%, rgba(79, 140, 255, .13), transparent 35rem), var(--primary-color);
     overflow: hidden;
+    transition: background-color .18s ease, color .18s ease;
 }
 
 button, input { font: inherit; }
 button { color: inherit; }
+button:focus-visible, input:focus-visible, a:focus-visible {
+    outline: 3px solid color-mix(in srgb, var(--accent-color) 65%, transparent);
+    outline-offset: 2px;
+}
 .material-symbols-rounded { font-size: 21px; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); }
 
@@ -101,7 +114,7 @@ body.document-sidebar-collapsed .document-sidebar {
 .icon-button,
 .pill-button,
 .menu-action {
-    border: 0;
+    border: 1px solid var(--border-color);
     cursor: pointer;
     background: var(--secondary-color);
     transition: background .18s ease, color .18s ease, transform .18s ease;
@@ -129,10 +142,10 @@ body.document-sidebar-collapsed .document-sidebar {
     font-weight: 500;
 }
 
-.icon-button:hover, .pill-button:hover, .menu-action:hover { background: var(--secondary-hover-color); }
+.icon-button:hover, .pill-button:hover, .menu-action:hover { background: var(--secondary-hover-color); transform: translateY(-1px); }
 .icon-button:active, .pill-button:active { transform: scale(.96); }
-.primary-button { color: #fff; background: var(--accent-color); }
-.primary-button:hover { background: #096ce8; }
+.primary-button { color: #fff; border-color: transparent; background: var(--accent-color); }
+.primary-button:hover { background: var(--accent-hover-color); }
 
 .panel-status {
     min-height: 22px;
@@ -251,7 +264,7 @@ body.document-sidebar-collapsed .document-sidebar {
     background: var(--secondary-color);
     font-size: .64rem;
 }
-.status-pill.ready { color: #55c98a; }
+.status-pill.ready { color: var(--success-color); }
 .status-pill.failed { color: var(--danger-color); }
 
 .empty-list { padding: 24px 10px; color: var(--subheading-color); text-align: center; font-size: .78rem; }
@@ -263,7 +276,7 @@ body.document-sidebar-collapsed .document-sidebar {
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    background: var(--primary-color);
+    background: radial-gradient(circle at 50% -20%, rgba(79, 140, 255, .13), transparent 35rem), var(--primary-color);
 }
 
 .top-bar {
@@ -320,6 +333,7 @@ body.document-sidebar-collapsed .document-sidebar {
     max-width: 78%;
     padding: 11px 16px;
     border-radius: 20px 20px 5px 20px;
+    border: 1px solid var(--border-color);
     background: var(--secondary-color);
     white-space: pre-wrap;
 }
@@ -351,8 +365,8 @@ body.document-sidebar-collapsed .document-sidebar {
     padding: 5px 5px 5px 14px;
     border: 1px solid var(--border-color);
     border-radius: 999px;
-    background: var(--secondary-color);
-    box-shadow: 0 9px 30px rgba(0, 0, 0, .16);
+    background: var(--panel-color);
+    box-shadow: 0 16px 45px rgba(0, 0, 0, .15);
 }
 .prompt-input {
     min-width: 0;

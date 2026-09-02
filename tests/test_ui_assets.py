@@ -203,5 +203,14 @@ def test_ui_uses_roboto_font_family() -> None:
     assert "Poppins" not in style
 
 
+def test_ui_uses_neutral_blue_surface_theme() -> None:
+    style = STYLE.read_text(encoding="utf-8")
+    for token in ("#111318", "#1b1e25", "#242832", "#4f8cff"):
+        assert token in style
+    assert "radial-gradient(circle at 50% -20%" in style
+    assert ":focus-visible" in style
+    assert "translateY(-1px)" in style
+
+
 def test_browser_script_is_valid_javascript() -> None:
     subprocess.run(["node", "--check", str(SCRIPT)], check=True, capture_output=True, text=True)
