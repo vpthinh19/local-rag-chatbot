@@ -212,5 +212,10 @@ def test_ui_uses_neutral_blue_surface_theme() -> None:
     assert "translateY(-1px)" in style
 
 
+def test_chat_input_has_no_focus_outline() -> None:
+    style = STYLE.read_text(encoding="utf-8")
+    assert ".prompt-input:focus-visible { outline: none; }" in style
+
+
 def test_browser_script_is_valid_javascript() -> None:
     subprocess.run(["node", "--check", str(SCRIPT)], check=True, capture_output=True, text=True)

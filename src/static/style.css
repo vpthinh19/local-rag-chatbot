@@ -377,6 +377,7 @@ body.document-sidebar-collapsed .document-sidebar {
     background: transparent;
     font-size: .96rem;
 }
+.prompt-input:focus-visible { outline: none; }
 .prompt-input::placeholder { color: var(--placeholder-color); }
 .prompt-actions { display: flex; align-items: center; gap: 5px; }
 #send-prompt-btn { display: none; }
